@@ -49,7 +49,7 @@ The `client` package provides `ReporterClient`, which:
 - buffers events in memory
 - periodically flushes them as batches
 - signs each batch request
-- retries naturally by leaving failed batches pending
+- drops any batch whose delivery fails (fire-and-forget)
 - flushes remaining events on `Stop`
 
 ## Sending events
@@ -152,8 +152,8 @@ func handleUsageBatch(r *http.Request, body []byte, sharedSecret string) error {
 ## Delivery model
 
 - batching is in-memory
-- each flushed batch gets a `DeliveryID`
-- failed deliveries remain pending and are retried on the next flush
-- `Stop` flushes current and pending events before returning
+- each flushed batch gets a `DeliveryID`, which is also used as the signing nonce
+- delivery is fire-and-forget: if a batch fails to send it is logged and dropped
+- `Stop` attempts one final flush of buffered events before returning
 
-This module does not prescribe server-side storage or deduplication strategy; receivers typically use `DeliveryID` or `EventID` depending on the guarantees they want.
+Callers that need durable delivery must layer that on top of this client.
