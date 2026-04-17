@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	defaultFlushInterval     = 2 * time.Second
-	defaultMaxBatchSize      = 1000
-	defaultMaxPendingBatches = 64
+	defaultFlushInterval = 2 * time.Second
+	defaultMaxBatchSize  = 1000
 )
 
 type Config struct {
@@ -32,23 +31,22 @@ type Config struct {
 	// MaxBatchSize caps the number of events rolled into a single outbound batch.
 	// Defaults to 1000 when unset or non-positive.
 	MaxBatchSize int
-	// MaxPendingBatches caps the number of batches held in memory awaiting delivery.
-	// When exceeded, the oldest pending batch is dropped. Defaults to 64.
-	MaxPendingBatches int
 }
 
+// ReporterClient batches usage events and delivers them to the controlplane
+// over signed HTTP. Delivery is fire-and-forget: if a batch fails, it is
+// logged and dropped. Callers that need durable delivery must layer that on
+// top of this client.
 type ReporterClient struct {
-	endpoint          string
-	reporter          contract.Reporter
-	secret            string
-	flushInterval     time.Duration
-	httpClient        *http.Client
-	maxBatchSize      int
-	maxPendingBatches int
+	endpoint      string
+	reporter      contract.Reporter
+	secret        string
+	flushInterval time.Duration
+	httpClient    *http.Client
+	maxBatchSize  int
 
 	mu      sync.Mutex
 	current []contract.Event
-	pending []*contract.Batch
 
 	quit     chan struct{}
 	stopOnce sync.Once
@@ -70,20 +68,15 @@ func New(cfg Config) *ReporterClient {
 	if maxBatchSize <= 0 {
 		maxBatchSize = defaultMaxBatchSize
 	}
-	maxPendingBatches := cfg.MaxPendingBatches
-	if maxPendingBatches <= 0 {
-		maxPendingBatches = defaultMaxPendingBatches
-	}
 
 	c := &ReporterClient{
-		endpoint:          strings.TrimRight(cfg.Endpoint, "/"),
-		reporter:          cfg.Reporter,
-		secret:            cfg.Secret,
-		flushInterval:     interval,
-		httpClient:        httpClient,
-		maxBatchSize:      maxBatchSize,
-		maxPendingBatches: maxPendingBatches,
-		quit:              make(chan struct{}),
+		endpoint:      strings.TrimRight(cfg.Endpoint, "/"),
+		reporter:      cfg.Reporter,
+		secret:        cfg.Secret,
+		flushInterval: interval,
+		httpClient:    httpClient,
+		maxBatchSize:  maxBatchSize,
+		quit:          make(chan struct{}),
 	}
 
 	if c.endpoint != "" && c.secret != "" && c.reporter.ID != "" {
@@ -117,23 +110,24 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 	c.mu.Unlock()
 }
 
+// Flush drains buffered events into batches and sends each one. Failed batches
+// are logged and discarded; there is no retry queue.
 func (c *ReporterClient) Flush(ctx context.Context) error {
 	if !c.Enabled() {
 		return nil
 	}
 
-	c.rollCurrentBatch()
-
-	for {
-		batch := c.nextPending()
-		if batch == nil {
-			return nil
-		}
+	for _, batch := range c.drainBatches() {
 		if err := c.sendBatch(ctx, batch); err != nil {
-			return err
+			slog.Warn("usage reporter dropped batch",
+				"reporter_id", c.reporter.ID,
+				"delivery_id", batch.DeliveryID,
+				"events", len(batch.Events),
+				"error", err,
+			)
 		}
-		c.popPending(batch.DeliveryID)
 	}
+	return nil
 }
 
 func (c *ReporterClient) Stop(ctx context.Context) error {
@@ -162,13 +156,16 @@ func (c *ReporterClient) loop() {
 	}
 }
 
-func (c *ReporterClient) rollCurrentBatch() {
+// drainBatches moves the current event buffer into one or more outbound
+// batches sized at most maxBatchSize.
+func (c *ReporterClient) drainBatches() []*contract.Batch {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.current) == 0 {
-		return
+		return nil
 	}
 
+	batches := make([]*contract.Batch, 0, (len(c.current)+c.maxBatchSize-1)/c.maxBatchSize)
 	for start := 0; start < len(c.current); start += c.maxBatchSize {
 		end := start + c.maxBatchSize
 		if end > len(c.current) {
@@ -176,46 +173,13 @@ func (c *ReporterClient) rollCurrentBatch() {
 		}
 		events := make([]contract.Event, end-start)
 		copy(events, c.current[start:end])
-		c.pending = append(c.pending, &contract.Batch{
+		batches = append(batches, &contract.Batch{
 			DeliveryID: uuid.NewString(),
 			Events:     events,
 		})
 	}
 	c.current = nil
-
-	if overflow := len(c.pending) - c.maxPendingBatches; overflow > 0 {
-		dropped := c.pending[:overflow]
-		c.pending = c.pending[overflow:]
-		var droppedEvents int
-		for _, b := range dropped {
-			droppedEvents += len(b.Events)
-		}
-		slog.Warn("usage reporter dropped oldest pending batches",
-			"reporter_id", c.reporter.ID,
-			"dropped_batches", overflow,
-			"dropped_events", droppedEvents,
-		)
-	}
-}
-
-func (c *ReporterClient) nextPending() *contract.Batch {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.pending) == 0 {
-		return nil
-	}
-	return c.pending[0]
-}
-
-func (c *ReporterClient) popPending(deliveryID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.pending) == 0 {
-		return
-	}
-	if c.pending[0].DeliveryID == deliveryID {
-		c.pending = c.pending[1:]
-	}
+	return batches
 }
 
 func (c *ReporterClient) sendBatch(ctx context.Context, batch *contract.Batch) error {
