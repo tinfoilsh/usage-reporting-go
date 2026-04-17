@@ -121,7 +121,7 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 		copy(meters, event.Meters)
 		event.Meters = meters
 	}
-	if len(event.Attributes) > 0 {
+	if event.Attributes != nil {
 		attrs := make(map[string]string, len(event.Attributes))
 		for k, v := range event.Attributes {
 			attrs[k] = v
