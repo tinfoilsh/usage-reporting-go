@@ -14,12 +14,6 @@ type Reporter struct {
 	Service string `json:"service"`
 }
 
-type Principal struct {
-	Type  string `json:"type,omitempty"`
-	ID    string `json:"id,omitempty"`
-	OrgID string `json:"org_id,omitempty"`
-}
-
 type Operation struct {
 	Service string `json:"service"`
 	Name    string `json:"name"`
@@ -35,7 +29,6 @@ type Event struct {
 	RequestID  string            `json:"request_id,omitempty"`
 	OccurredAt time.Time         `json:"occurred_at"`
 	Reporter   Reporter          `json:"reporter"`
-	Principal  *Principal        `json:"principal,omitempty"`
 	Operation  Operation         `json:"operation"`
 	APIKey     string            `json:"api_key,omitempty"`
 	Meters     []Meter           `json:"meters"`
