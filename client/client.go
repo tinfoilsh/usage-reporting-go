@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,7 +17,11 @@ import (
 	"github.com/tinfoilsh/usage-reporting-go/signing"
 )
 
-const defaultFlushInterval = 2 * time.Second
+const (
+	defaultFlushInterval     = 2 * time.Second
+	defaultMaxBatchSize      = 1000
+	defaultMaxPendingBatches = 64
+)
 
 type Config struct {
 	Endpoint      string
@@ -24,14 +29,22 @@ type Config struct {
 	Secret        string
 	FlushInterval time.Duration
 	HTTPClient    *http.Client
+	// MaxBatchSize caps the number of events rolled into a single outbound batch.
+	// Defaults to 1000 when unset or non-positive.
+	MaxBatchSize int
+	// MaxPendingBatches caps the number of batches held in memory awaiting delivery.
+	// When exceeded, the oldest pending batch is dropped. Defaults to 64.
+	MaxPendingBatches int
 }
 
 type ReporterClient struct {
-	endpoint      string
-	reporter      contract.Reporter
-	secret        string
-	flushInterval time.Duration
-	httpClient    *http.Client
+	endpoint          string
+	reporter          contract.Reporter
+	secret            string
+	flushInterval     time.Duration
+	httpClient        *http.Client
+	maxBatchSize      int
+	maxPendingBatches int
 
 	mu      sync.Mutex
 	current []contract.Event
@@ -53,13 +66,24 @@ func New(cfg Config) *ReporterClient {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
 
+	maxBatchSize := cfg.MaxBatchSize
+	if maxBatchSize <= 0 {
+		maxBatchSize = defaultMaxBatchSize
+	}
+	maxPendingBatches := cfg.MaxPendingBatches
+	if maxPendingBatches <= 0 {
+		maxPendingBatches = defaultMaxPendingBatches
+	}
+
 	c := &ReporterClient{
-		endpoint:      strings.TrimRight(cfg.Endpoint, "/"),
-		reporter:      cfg.Reporter,
-		secret:        cfg.Secret,
-		flushInterval: interval,
-		httpClient:    httpClient,
-		quit:          make(chan struct{}),
+		endpoint:          strings.TrimRight(cfg.Endpoint, "/"),
+		reporter:          cfg.Reporter,
+		secret:            cfg.Secret,
+		flushInterval:     interval,
+		httpClient:        httpClient,
+		maxBatchSize:      maxBatchSize,
+		maxPendingBatches: maxPendingBatches,
+		quit:              make(chan struct{}),
 	}
 
 	if c.endpoint != "" && c.secret != "" && c.reporter.ID != "" {
@@ -144,13 +168,34 @@ func (c *ReporterClient) rollCurrentBatch() {
 	if len(c.current) == 0 {
 		return
 	}
-	events := make([]contract.Event, len(c.current))
-	copy(events, c.current)
-	c.pending = append(c.pending, &contract.Batch{
-		DeliveryID: uuid.NewString(),
-		Events:     events,
-	})
+
+	for start := 0; start < len(c.current); start += c.maxBatchSize {
+		end := start + c.maxBatchSize
+		if end > len(c.current) {
+			end = len(c.current)
+		}
+		events := make([]contract.Event, end-start)
+		copy(events, c.current[start:end])
+		c.pending = append(c.pending, &contract.Batch{
+			DeliveryID: uuid.NewString(),
+			Events:     events,
+		})
+	}
 	c.current = nil
+
+	if overflow := len(c.pending) - c.maxPendingBatches; overflow > 0 {
+		dropped := c.pending[:overflow]
+		c.pending = c.pending[overflow:]
+		var droppedEvents int
+		for _, b := range dropped {
+			droppedEvents += len(b.Events)
+		}
+		slog.Warn("usage reporter dropped oldest pending batches",
+			"reporter_id", c.reporter.ID,
+			"dropped_batches", overflow,
+			"dropped_events", droppedEvents,
+		)
+	}
 }
 
 func (c *ReporterClient) nextPending() *contract.Batch {
