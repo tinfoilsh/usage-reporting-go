@@ -61,7 +61,16 @@ func New(cfg Config) *ReporterClient {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 10 * time.Second}
+		httpClient = &http.Client{
+			Timeout: 10 * time.Second,
+			// Block redirects by default. The batch is a signed HMAC against a
+			// specific path and host; following a redirect would send signed
+			// telemetry (and the reporter identity header) to a different
+			// host, which the shared secret cannot authenticate.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 
 	maxBatchSize := cfg.MaxBatchSize
@@ -103,6 +112,21 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 	}
 	if event.Reporter.ID == "" {
 		event.Reporter = c.reporter
+	}
+
+	// Snapshot reference-typed fields so later caller mutations of the meter
+	// slice or attribute map cannot corrupt queued telemetry.
+	if len(event.Meters) > 0 {
+		meters := make([]contract.Meter, len(event.Meters))
+		copy(meters, event.Meters)
+		event.Meters = meters
+	}
+	if len(event.Attributes) > 0 {
+		attrs := make(map[string]string, len(event.Attributes))
+		for k, v := range event.Attributes {
+			attrs[k] = v
+		}
+		event.Attributes = attrs
 	}
 
 	c.mu.Lock()
