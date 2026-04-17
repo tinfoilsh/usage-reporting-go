@@ -21,12 +21,23 @@ func BodyHash(body []byte) string {
 func CanonicalString(method, path, reporterID, timestamp, nonce string, body []byte) string {
 	return strings.Join([]string{
 		strings.ToUpper(method),
-		path,
+		canonicalPath(path),
 		reporterID,
 		timestamp,
 		nonce,
 		BodyHash(body),
 	}, "\n")
+}
+
+// canonicalPath ensures clients and servers agree on the path portion of the
+// signature regardless of which HTTP stack they use. Go's net/http exposes
+// root-path URLs as "" via req.URL.Path, while common server frameworks
+// expose them as "/". Normalizing here keeps both sides in lockstep.
+func canonicalPath(path string) string {
+	if path == "" {
+		return "/"
+	}
+	return path
 }
 
 func Sign(method, path, reporterID, timestamp, nonce string, body []byte, secret string) string {
