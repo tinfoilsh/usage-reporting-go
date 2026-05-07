@@ -121,6 +121,11 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 		copy(meters, event.Meters)
 		event.Meters = meters
 	}
+	if len(event.Counters) > 0 {
+		counters := make([]contract.Counter, len(event.Counters))
+		copy(counters, event.Counters)
+		event.Counters = counters
+	}
 	if event.Attributes != nil {
 		attrs := make(map[string]string, len(event.Attributes))
 		for k, v := range event.Attributes {

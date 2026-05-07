@@ -24,6 +24,13 @@ type Meter struct {
 	Quantity int64  `json:"quantity"`
 }
 
+const CounterCustomerRequests = "customer_requests"
+
+type Counter struct {
+	Name     string `json:"name"`
+	Quantity int64  `json:"quantity"`
+}
+
 type Event struct {
 	EventID    string            `json:"event_id"`
 	RequestID  string            `json:"request_id,omitempty"`
@@ -32,6 +39,7 @@ type Event struct {
 	Operation  Operation         `json:"operation"`
 	APIKey     string            `json:"api_key,omitempty"`
 	Meters     []Meter           `json:"meters"`
+	Counters   []Counter         `json:"counters,omitempty"`
 	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
