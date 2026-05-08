@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -83,6 +85,56 @@ func TestAddEventEnforcesBufferCeiling(t *testing.T) {
 		if ev.EventID != wantIDs[i] {
 			t.Fatalf("event[%d] mismatch: got %q want %q", i, ev.EventID, wantIDs[i])
 		}
+	}
+}
+
+// TestAddEventConcurrentAtCapacity asserts that AddEvent does not block or
+// corrupt the ring under sustained backpressure: once the buffer is full,
+// every concurrent enqueue must be O(1) and the buffer must hold exactly
+// MaxBufferedEvents distinct freshest events.
+func TestAddEventConcurrentAtCapacity(t *testing.T) {
+	const cap = 256
+	const writers = 16
+	const perWriter = 1024
+
+	c := New(Config{
+		Endpoint:          "https://example.invalid/usage",
+		ReporterID:        "reporter",
+		Secret:            "secret",
+		MaxBufferedEvents: cap,
+	})
+	defer c.Stop(context.Background())
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(writer int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				c.AddEvent(contract.Event{
+					EventID:   fmt.Sprintf("w%d-i%d", writer, i),
+					Operation: contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
+					APIKey:    "sk-test",
+				})
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	batches := c.drainBatches()
+	total := 0
+	seen := make(map[string]struct{})
+	for _, b := range batches {
+		for _, ev := range b.Events {
+			if _, dup := seen[ev.EventID]; dup {
+				t.Fatalf("ring buffer yielded duplicate event id %q", ev.EventID)
+			}
+			seen[ev.EventID] = struct{}{}
+			total++
+		}
+	}
+	if total != cap {
+		t.Fatalf("expected exactly %d buffered events under sustained pressure, got %d", cap, total)
 	}
 }
 
