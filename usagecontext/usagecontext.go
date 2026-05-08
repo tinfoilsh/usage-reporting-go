@@ -21,11 +21,15 @@ const (
 	signatureDomain = "tinfoil-usage-context-v1:"
 )
 
+// Context describes the customer-facing request a downstream service is being
+// invoked inside of. BillCustomerRequest tells the downstream whether to count
+// the call as its own customer-billable request: parents that have already
+// counted the request set it false; direct customer-facing callers set it true.
 type Context struct {
-	RootRequestID        string    `json:"root_request_id,omitempty"`
-	ParentService        string    `json:"parent_service,omitempty"`
-	CustomerRequestCount *int64    `json:"customer_request_count,omitempty"`
-	IssuedAt             time.Time `json:"issued_at"`
+	RootRequestID       string    `json:"root_request_id,omitempty"`
+	ParentService       string    `json:"parent_service,omitempty"`
+	BillCustomerRequest bool      `json:"bill_customer_request,omitempty"`
+	IssuedAt            time.Time `json:"issued_at"`
 }
 
 func Sign(ctx Context, secret string) (encoded, signature string, err error) {
