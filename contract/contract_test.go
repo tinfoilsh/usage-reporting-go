@@ -2,23 +2,22 @@ package contract
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestEventJSONRoundTripsCounters(t *testing.T) {
+func TestEventJSONRoundTripsCustomerRequests(t *testing.T) {
 	original := Event{
-		EventID:    "event-1",
-		RequestID:  "request-1",
-		OccurredAt: time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
-		Reporter:   Reporter{ID: "reporter", Service: "router"},
-		Operation:  Operation{Service: "router", Name: "model_request"},
-		APIKey:     "tk_test",
+		EventID:          "event-1",
+		RequestID:        "request-1",
+		OccurredAt:       time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+		Reporter:         Reporter{ID: "reporter", Service: "router"},
+		Operation:        Operation{Service: "router", Name: "model_request"},
+		APIKey:           "tk_test",
+		CustomerRequests: 1,
 		Meters: []Meter{
-			{Name: "requests", Quantity: 1},
-		},
-		Counters: []Counter{
-			{Name: CounterCustomerRequests, Quantity: 1},
+			{Name: "input_tokens", Quantity: 10},
 		},
 		Attributes: map[string]string{"model": "gpt-oss-120b"},
 	}
@@ -32,13 +31,26 @@ func TestEventJSONRoundTripsCounters(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("unmarshal event: %v", err)
 	}
-	if len(got.Counters) != 1 {
-		t.Fatalf("expected one counter, got %d", len(got.Counters))
+	if got.CustomerRequests != 1 {
+		t.Fatalf("customer_requests did not round-trip: got %d", got.CustomerRequests)
 	}
-	if got.Counters[0].Name != CounterCustomerRequests || got.Counters[0].Quantity != 1 {
-		t.Fatalf("unexpected counter: %+v", got.Counters[0])
-	}
-	if len(got.Meters) != 1 || got.Meters[0].Quantity != 1 {
+	if len(got.Meters) != 1 || got.Meters[0].Name != "input_tokens" || got.Meters[0].Quantity != 10 {
 		t.Fatalf("meter did not round-trip: %+v", got.Meters)
 	}
 }
+
+func TestEventJSONOmitsCustomerRequestsWhenZero(t *testing.T) {
+	event := Event{
+		EventID:    "event-1",
+		OccurredAt: time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
+		Operation:  Operation{Service: "websearch", Name: "session"},
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	if bytes := string(data); strings.Contains(bytes, "customer_requests") {
+		t.Fatalf("expected customer_requests to be omitted when zero, got %s", bytes)
+	}
+}
+
