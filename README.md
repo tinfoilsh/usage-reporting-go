@@ -45,7 +45,7 @@ Provides `ReporterClient`, which:
 
 ### `usagecontext`
 
-Lets a service propagate a signed `Context` (root request ID, parent service, customer-request-count) to a downstream service over HTTP headers. Downstream services verify the signature and use the context to decide whether to bill the call as its own customer request or treat it as part of the parent's already-counted request. This is what prevents double-counting when a router fans out to a tool service.
+Lets a service propagate a signed `Context` (root request ID, parent service, billing decision) to a downstream service over HTTP headers. Downstream services verify the signature and use the context to decide whether to bill the call as its own customer request or treat it as part of the parent's already-counted request. This is what prevents double-counting when a router fans out to a tool service.
 
 ## Sending events
 
@@ -98,8 +98,11 @@ On the receiving side:
 1. read the raw request body
 2. extract `X-Tinfoil-*` signing headers
 3. verify the signature with the shared secret
-4. unmarshal the body into `contract.Batch`
-5. process the batch atomically if you need retry-safe ingestion
+4. enforce timestamp skew and reject any batch whose `delivery_id` (used as the signing nonce) has already been seen, to prevent replay
+5. unmarshal the body into `contract.Batch`
+6. process the batch atomically if you need retry-safe ingestion
+
+The library only signs and verifies; the receiver is responsible for tracking recently-seen `delivery_id` values within the timestamp skew window.
 
 ```go
 package main
@@ -149,12 +152,11 @@ When a parent service (for example a router) calls a downstream tool service tha
 ```go
 import "github.com/tinfoilsh/usage-reporting-go/usagecontext"
 
-count := int64(0)
 err := usagecontext.SetHeaders(req.Header, usagecontext.Context{
-	RootRequestID:        "req_123",
-	ParentService:        contract.ServiceRouter,
-	CustomerRequestCount: &count,
-	IssuedAt:             time.Now().UTC(),
+	RootRequestID:       "req_123",
+	ParentService:       contract.ServiceRouter,
+	BillCustomerRequest: false,
+	IssuedAt:            time.Now().UTC(),
 }, contextSigningSecret)
 ```
 
@@ -167,8 +169,8 @@ if err != nil {
 	// through to the direct-billing default.
 }
 customerRequests := int64(1)
-if ok && ctx.CustomerRequestCount != nil && *ctx.CustomerRequestCount >= 0 {
-	customerRequests = *ctx.CustomerRequestCount
+if ok && !ctx.BillCustomerRequest {
+	customerRequests = 0
 }
 ```
 
@@ -176,9 +178,9 @@ A direct customer-facing call (no signed header) bills as its own request. A cal
 
 ## Delivery model
 
-- batching is in-memory
-- each flushed batch gets a `DeliveryID`, which is also used as the signing nonce
-- delivery is fire-and-forget: if a batch fails to send it is logged and dropped
-- `Stop` performs a final flush of buffered events before returning
+- batching is in-memory, with a configurable `MaxBufferedEvents` ceiling; once full, the oldest event is dropped to make room for the newest and a warning is logged.
+- each flushed batch gets a `DeliveryID`, which is also used as the signing nonce.
+- delivery is fire-and-forget: if a batch fails to send it is logged and dropped. `Flush` does not surface delivery errors, since there is no retry queue for callers to react against.
+- `Stop` performs a final flush of buffered events before returning.
 
 Callers that need durable delivery must layer that on top of this client.
