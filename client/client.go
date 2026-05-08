@@ -53,8 +53,13 @@ type ReporterClient struct {
 	maxBatchSize      int
 	maxBufferedEvents int
 
-	mu       sync.Mutex
-	current  []contract.Event
+	mu sync.Mutex
+	// ring is a fixed-capacity ring buffer holding queued events. head points
+	// at the oldest event, size tracks how many slots are populated. A full
+	// buffer drops the oldest event in O(1) by advancing head.
+	ring     []contract.Event
+	head     int
+	size     int
 	dropped  uint64
 	notified uint64
 
@@ -101,6 +106,7 @@ func New(cfg Config) *ReporterClient {
 		httpClient:        httpClient,
 		maxBatchSize:      maxBatchSize,
 		maxBufferedEvents: maxBufferedEvents,
+		ring:              make([]contract.Event, maxBufferedEvents),
 		quit:              make(chan struct{}),
 	}
 
@@ -143,30 +149,31 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 	}
 
 	c.mu.Lock()
-	if len(c.current) >= c.maxBufferedEvents {
-		// Drop the oldest event. The reporter is fire-and-forget, so the most
-		// useful behaviour under sustained backpressure is to keep the freshest
-		// telemetry and surface that drops occurred.
-		copy(c.current, c.current[1:])
-		c.current[len(c.current)-1] = event
-		c.dropped++
-		dropped := c.dropped
-		shouldLog := dropped == 1 || dropped-c.notified >= 1000
-		if shouldLog {
-			c.notified = dropped
-		}
+	ringCap := len(c.ring)
+	if c.size < ringCap {
+		c.ring[(c.head+c.size)%ringCap] = event
+		c.size++
 		c.mu.Unlock()
-		if shouldLog {
-			slog.Warn("usage reporter buffer full; dropped oldest event",
-				"reporter_id", c.reporterID,
-				"max_buffered_events", c.maxBufferedEvents,
-				"total_dropped", dropped,
-			)
-		}
 		return
 	}
-	c.current = append(c.current, event)
+	// Buffer is full: overwrite the oldest slot and advance head. Fire-and-
+	// forget telemetry favours freshness over completeness under backpressure.
+	c.ring[c.head] = event
+	c.head = (c.head + 1) % ringCap
+	c.dropped++
+	dropped := c.dropped
+	shouldLog := dropped == 1 || dropped-c.notified >= 1000
+	if shouldLog {
+		c.notified = dropped
+	}
 	c.mu.Unlock()
+	if shouldLog {
+		slog.Warn("usage reporter buffer full; dropped oldest event",
+			"reporter_id", c.reporterID,
+			"max_buffered_events", c.maxBufferedEvents,
+			"total_dropped", dropped,
+		)
+	}
 }
 
 // Flush drains buffered events into batches and sends each one. Failed batches
@@ -213,29 +220,40 @@ func (c *ReporterClient) loop() {
 	}
 }
 
-// drainBatches moves the current event buffer into one or more outbound
-// batches sized at most maxBatchSize.
+// drainBatches moves queued events into one or more outbound batches sized at
+// most maxBatchSize, reading them out of the ring buffer in FIFO order.
 func (c *ReporterClient) drainBatches() []*contract.Batch {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.current) == 0 {
+	if c.size == 0 {
 		return nil
 	}
 
-	batches := make([]*contract.Batch, 0, (len(c.current)+c.maxBatchSize-1)/c.maxBatchSize)
-	for start := 0; start < len(c.current); start += c.maxBatchSize {
-		end := start + c.maxBatchSize
-		if end > len(c.current) {
-			end = len(c.current)
+	ringCap := len(c.ring)
+	total := c.size
+	batches := make([]*contract.Batch, 0, (total+c.maxBatchSize-1)/c.maxBatchSize)
+	for emitted := 0; emitted < total; {
+		remaining := total - emitted
+		batchSize := c.maxBatchSize
+		if remaining < batchSize {
+			batchSize = remaining
 		}
-		events := make([]contract.Event, end-start)
-		copy(events, c.current[start:end])
+		events := make([]contract.Event, batchSize)
+		for i := 0; i < batchSize; i++ {
+			idx := (c.head + emitted + i) % ringCap
+			events[i] = c.ring[idx]
+			// Release the slot so any references it holds can be GC'd while
+			// the batch is in flight.
+			c.ring[idx] = contract.Event{}
+		}
 		batches = append(batches, &contract.Batch{
 			DeliveryID: uuid.NewString(),
 			Events:     events,
 		})
+		emitted += batchSize
 	}
-	c.current = nil
+	c.head = 0
+	c.size = 0
 	return batches
 }
 
