@@ -12,7 +12,9 @@ const (
 // IngestionPath is the controlplane HTTP path that accepts signed batches.
 const IngestionPath = "/api/internal/usage-reports"
 
-// Service identifiers used in Operation.Service.
+// Service identifiers used in Operation.Service for Tinfoil-owned reporters.
+// Other services may use their own stable service and operation strings; the
+// controlplane pricing registry decides whether an emitted operation is priced.
 const (
 	ServiceRouter    = "router"
 	ServiceWebsearch = "websearch"
@@ -53,7 +55,12 @@ type Meter struct {
 }
 
 type Event struct {
-	EventID    string    `json:"event_id"`
+	// EventID is globally unique for this specific usage event and is the
+	// natural idempotency key once receivers persist accepted events.
+	EventID string `json:"event_id"`
+	// RequestID identifies the customer-facing request or session that caused
+	// the event. For the originating service it should match the usage-context
+	// RootRequestID propagated to downstream services.
 	RequestID  string    `json:"request_id,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
 	Operation  Operation `json:"operation"`
@@ -68,6 +75,8 @@ type Event struct {
 }
 
 type Batch struct {
+	// DeliveryID is unique for one flush attempt and is used as the signing
+	// nonce. Retried events should keep their EventID but use a new DeliveryID.
 	DeliveryID string  `json:"delivery_id"`
 	Events     []Event `json:"events"`
 }

@@ -26,8 +26,11 @@ const (
 // the call as its own customer-billable request: parents that have already
 // counted the request set it false; direct customer-facing callers set it true.
 type Context struct {
+	ContextID           string    `json:"context_id,omitempty"`
 	RootRequestID       string    `json:"root_request_id,omitempty"`
 	ParentService       string    `json:"parent_service,omitempty"`
+	APIKeyHash          string    `json:"api_key_hash,omitempty"`
+	Depth               int       `json:"depth,omitempty"`
 	BillCustomerRequest bool      `json:"bill_customer_request,omitempty"`
 	IssuedAt            time.Time `json:"issued_at"`
 }
@@ -93,6 +96,24 @@ func FromHeaders(header http.Header, secret string, now time.Time, maxSkew time.
 	}
 	ctx, err := Verify(encoded, signature, secret, now, maxSkew)
 	return ctx, true, err
+}
+
+func HashAPIKey(apiKey string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func VerifyAPIKeyHash(apiKey, expectedHash string) bool {
+	expectedHash = strings.TrimSpace(expectedHash)
+	if expectedHash == "" {
+		return true
+	}
+	actualHash := HashAPIKey(apiKey)
+	return subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) == 1
 }
 
 func signEncoded(encoded, secret string) string {
