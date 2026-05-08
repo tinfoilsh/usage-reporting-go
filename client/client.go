@@ -24,7 +24,7 @@ const (
 
 type Config struct {
 	Endpoint      string
-	Reporter      contract.Reporter
+	ReporterID    string
 	Secret        string
 	FlushInterval time.Duration
 	HTTPClient    *http.Client
@@ -39,7 +39,7 @@ type Config struct {
 // top of this client.
 type ReporterClient struct {
 	endpoint      string
-	reporter      contract.Reporter
+	reporterID    string
 	secret        string
 	flushInterval time.Duration
 	httpClient    *http.Client
@@ -80,7 +80,7 @@ func New(cfg Config) *ReporterClient {
 
 	c := &ReporterClient{
 		endpoint:      strings.TrimRight(cfg.Endpoint, "/"),
-		reporter:      cfg.Reporter,
+		reporterID:    cfg.ReporterID,
 		secret:        cfg.Secret,
 		flushInterval: interval,
 		httpClient:    httpClient,
@@ -88,7 +88,7 @@ func New(cfg Config) *ReporterClient {
 		quit:          make(chan struct{}),
 	}
 
-	if c.endpoint != "" && c.secret != "" && c.reporter.ID != "" {
+	if c.endpoint != "" && c.secret != "" && c.reporterID != "" {
 		c.wg.Add(1)
 		go c.loop()
 	}
@@ -97,7 +97,7 @@ func New(cfg Config) *ReporterClient {
 }
 
 func (c *ReporterClient) Enabled() bool {
-	return c.endpoint != "" && c.secret != "" && c.reporter.ID != ""
+	return c.endpoint != "" && c.secret != "" && c.reporterID != ""
 }
 
 func (c *ReporterClient) AddEvent(event contract.Event) {
@@ -109,9 +109,6 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 	}
 	if event.OccurredAt.IsZero() {
 		event.OccurredAt = time.Now().UTC()
-	}
-	if event.Reporter.ID == "" {
-		event.Reporter = c.reporter
 	}
 
 	// Snapshot reference-typed fields so later caller mutations of the meter
@@ -144,7 +141,7 @@ func (c *ReporterClient) Flush(ctx context.Context) error {
 	for _, batch := range c.drainBatches() {
 		if err := c.sendBatch(ctx, batch); err != nil {
 			slog.Warn("usage reporter dropped batch",
-				"reporter_id", c.reporter.ID,
+				"reporter_id", c.reporterID,
 				"delivery_id", batch.DeliveryID,
 				"events", len(batch.Events),
 				"error", err,
@@ -219,10 +216,10 @@ func (c *ReporterClient) sendBatch(ctx context.Context, batch *contract.Batch) e
 
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	nonce := batch.DeliveryID
-	signature := signing.Sign(http.MethodPost, req.URL.Path, c.reporter.ID, timestamp, nonce, body, c.secret)
+	signature := signing.Sign(http.MethodPost, req.URL.Path, c.reporterID, timestamp, nonce, body, c.secret)
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(contract.HeaderReporterID, c.reporter.ID)
+	req.Header.Set(contract.HeaderReporterID, c.reporterID)
 	req.Header.Set(contract.HeaderTimestamp, timestamp)
 	req.Header.Set(contract.HeaderNonce, nonce)
 	req.Header.Set(contract.HeaderSignature, signature)

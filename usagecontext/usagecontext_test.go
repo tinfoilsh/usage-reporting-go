@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/tinfoilsh/usage-reporting-go/contract"
 )
 
 func TestSignAndVerify(t *testing.T) {
@@ -11,7 +13,7 @@ func TestSignAndVerify(t *testing.T) {
 	count := int64(0)
 	ctx := Context{
 		RootRequestID:        "request-1",
-		ParentService:        "router",
+		ParentService:        contract.ServiceRouter,
 		CustomerRequestCount: &count,
 		IssuedAt:             now,
 	}
@@ -77,7 +79,7 @@ func TestHeadersRoundTrip(t *testing.T) {
 	header := make(http.Header)
 	if err := SetHeaders(header, Context{
 		RootRequestID:        "request-1",
-		ParentService:        "router",
+		ParentService:        contract.ServiceRouter,
 		CustomerRequestCount: &count,
 		IssuedAt:             now,
 	}, "secret"); err != nil {

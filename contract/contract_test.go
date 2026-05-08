@@ -12,12 +12,11 @@ func TestEventJSONRoundTripsCustomerRequests(t *testing.T) {
 		EventID:          "event-1",
 		RequestID:        "request-1",
 		OccurredAt:       time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
-		Reporter:         Reporter{ID: "reporter", Service: "router"},
-		Operation:        Operation{Service: "router", Name: "model_request"},
+		Operation:        Operation{Service: ServiceRouter, Name: OperationRouterModelRequest},
 		APIKey:           "tk_test",
 		CustomerRequests: 1,
 		Meters: []Meter{
-			{Name: "input_tokens", Quantity: 10},
+			{Name: MeterInputTokens, Quantity: 10},
 		},
 		Attributes: map[string]string{"model": "gpt-oss-120b"},
 	}
@@ -34,7 +33,7 @@ func TestEventJSONRoundTripsCustomerRequests(t *testing.T) {
 	if got.CustomerRequests != 1 {
 		t.Fatalf("customer_requests did not round-trip: got %d", got.CustomerRequests)
 	}
-	if len(got.Meters) != 1 || got.Meters[0].Name != "input_tokens" || got.Meters[0].Quantity != 10 {
+	if len(got.Meters) != 1 || got.Meters[0].Name != MeterInputTokens || got.Meters[0].Quantity != 10 {
 		t.Fatalf("meter did not round-trip: %+v", got.Meters)
 	}
 }
@@ -43,7 +42,7 @@ func TestEventJSONOmitsCustomerRequestsWhenZero(t *testing.T) {
 	event := Event{
 		EventID:    "event-1",
 		OccurredAt: time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
-		Operation:  Operation{Service: "websearch", Name: "session"},
+		Operation:  Operation{Service: ServiceWebsearch, Name: OperationWebsearchSession},
 	}
 	data, err := json.Marshal(event)
 	if err != nil {

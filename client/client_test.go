@@ -15,16 +15,16 @@ import (
 // and seeing that mutation reflected in the queued telemetry.
 func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	c := New(Config{
-		Endpoint: "https://example.invalid/usage",
-		Reporter: contract.Reporter{ID: "reporter"},
-		Secret:   "secret",
+		Endpoint:   "https://example.invalid/usage",
+		ReporterID: "reporter",
+		Secret:     "secret",
 	})
 	defer c.Stop(context.Background())
 
-	meters := []contract.Meter{{Name: "input_tokens", Quantity: 10}}
+	meters := []contract.Meter{{Name: contract.MeterInputTokens, Quantity: 10}}
 	attrs := map[string]string{"model": "gpt-oss-120b"}
 	c.AddEvent(contract.Event{
-		Operation:        contract.Operation{Service: "router", Name: "model_request"},
+		Operation:        contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
 		APIKey:           "sk-test",
 		CustomerRequests: 1,
 		Meters:           meters,
@@ -67,16 +67,16 @@ func TestFlushRefusesRedirects(t *testing.T) {
 	defer redirector.Close()
 
 	c := New(Config{
-		Endpoint: redirector.URL + "/usage",
-		Reporter: contract.Reporter{ID: "reporter"},
-		Secret:   "secret",
+		Endpoint:   redirector.URL + "/usage",
+		ReporterID: "reporter",
+		Secret:     "secret",
 	})
 	defer c.Stop(context.Background())
 
 	c.AddEvent(contract.Event{
-		Operation: contract.Operation{Service: "router", Name: "model_request"},
+		Operation: contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
 		APIKey:    "sk-test",
-		Meters:    []contract.Meter{{Name: "input_tokens", Quantity: 1}},
+		Meters:    []contract.Meter{{Name: contract.MeterInputTokens, Quantity: 1}},
 	})
 
 	_ = c.Flush(context.Background())
