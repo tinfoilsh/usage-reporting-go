@@ -10,12 +10,11 @@ import (
 
 func TestSignAndVerify(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	count := int64(0)
 	ctx := Context{
-		RootRequestID:        "request-1",
-		ParentService:        contract.ServiceRouter,
-		CustomerRequestCount: &count,
-		IssuedAt:             now,
+		RootRequestID:       "request-1",
+		ParentService:       contract.ServiceRouter,
+		BillCustomerRequest: false,
+		IssuedAt:            now,
 	}
 
 	encoded, signature, err := Sign(ctx, "secret")
@@ -33,18 +32,17 @@ func TestSignAndVerify(t *testing.T) {
 	if got.ParentService != ctx.ParentService {
 		t.Fatalf("parent service mismatch: got %q want %q", got.ParentService, ctx.ParentService)
 	}
-	if got.CustomerRequestCount == nil || *got.CustomerRequestCount != 0 {
-		t.Fatalf("customer request count mismatch: got %+v want pointer to 0", got.CustomerRequestCount)
+	if got.BillCustomerRequest {
+		t.Fatalf("bill_customer_request mismatch: got true want false")
 	}
 }
 
 func TestVerifyRejectsTampering(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	count := int64(1)
 	encoded, signature, err := Sign(Context{
-		RootRequestID:        "request-1",
-		CustomerRequestCount: &count,
-		IssuedAt:             now,
+		RootRequestID:       "request-1",
+		BillCustomerRequest: true,
+		IssuedAt:            now,
 	}, "secret")
 	if err != nil {
 		t.Fatalf("sign usage context: %v", err)
@@ -75,13 +73,12 @@ func TestVerifyRejectsStaleContext(t *testing.T) {
 
 func TestHeadersRoundTrip(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	count := int64(0)
 	header := make(http.Header)
 	if err := SetHeaders(header, Context{
-		RootRequestID:        "request-1",
-		ParentService:        contract.ServiceRouter,
-		CustomerRequestCount: &count,
-		IssuedAt:             now,
+		RootRequestID:       "request-1",
+		ParentService:       contract.ServiceRouter,
+		BillCustomerRequest: false,
+		IssuedAt:            now,
 	}, "secret"); err != nil {
 		t.Fatalf("set usage context headers: %v", err)
 	}
@@ -93,8 +90,8 @@ func TestHeadersRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("expected usage context headers to be present")
 	}
-	if got.CustomerRequestCount == nil || *got.CustomerRequestCount != 0 {
-		t.Fatalf("customer request count mismatch: got %+v want pointer to 0", got.CustomerRequestCount)
+	if got.BillCustomerRequest {
+		t.Fatalf("bill_customer_request mismatch: got true want false")
 	}
 }
 
