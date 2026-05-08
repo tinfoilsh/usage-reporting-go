@@ -9,10 +9,38 @@ const (
 	HeaderSignature  = "X-Tinfoil-Signature"
 )
 
-type Reporter struct {
-	ID      string `json:"id"`
-	Service string `json:"service"`
-}
+// IngestionPath is the controlplane HTTP path that accepts signed batches.
+const IngestionPath = "/api/internal/usage-reports"
+
+// Service identifiers used in Operation.Service.
+const (
+	ServiceRouter    = "router"
+	ServiceWebsearch = "websearch"
+	ServiceBuckets   = "buckets"
+)
+
+// Operation names for known services. Operations are always scoped by service,
+// so the same name (for example a hypothetical "session") can mean different
+// things across services.
+const (
+	OperationRouterModelRequest = "model_request"
+
+	OperationWebsearchSession = "session"
+
+	OperationBucketsPutObject    = "put_object"
+	OperationBucketsGetObject    = "get_object"
+	OperationBucketsHeadObject   = "head_object"
+	OperationBucketsDeleteObject = "delete_object"
+	OperationBucketsAddKey       = "add_key"
+	OperationBucketsRemoveKey    = "remove_key"
+)
+
+// Meter names. Pricing for a meter is keyed by (service, operation, name)
+// in the controlplane.
+const (
+	MeterInputTokens  = "input_tokens"
+	MeterOutputTokens = "output_tokens"
+)
 
 type Operation struct {
 	Service string `json:"service"`
@@ -28,7 +56,6 @@ type Event struct {
 	EventID    string    `json:"event_id"`
 	RequestID  string    `json:"request_id,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
-	Reporter   Reporter  `json:"reporter"`
 	Operation  Operation `json:"operation"`
 	APIKey     string    `json:"api_key,omitempty"`
 	// CustomerRequests records how many customer-billable requests this event
