@@ -1,12 +1,13 @@
 # usage-reporting-go
 
-`usage-reporting-go` is a small Go module for reporting internal usage events to a control plane over signed HTTP requests.
+`usage-reporting-go` is a small Go module for reporting internal usage events from edge services to a control plane over signed HTTP.
 
 It provides:
 
 - a shared event contract in `contract`
 - HMAC signing helpers in `signing`
 - a batching background reporter in `client`
+- signed request-context propagation in `usagecontext`
 
 ## Install
 
@@ -18,39 +19,33 @@ go get github.com/tinfoilsh/usage-reporting-go@latest
 
 ### `contract`
 
-The `contract` package defines the wire format:
+Defines the wire format and the well-known identifiers used across reporters and the controlplane:
 
-- `Reporter`: the service sending events
-- `Principal`: optional end-user or org attribution
-- `Operation`: the action being measured
-- `Meter`: a named counter such as `input_tokens`, `output_tokens`, or `requests`
-- `Event`: one usage record
-- `Batch`: a delivery envelope containing multiple events
-
-It also defines the signing header names used on outbound requests.
+- `Operation`: the action being measured, scoped by service (`Service` + `Name`).
+- `Meter`: a named integer quantity such as `input_tokens` or `output_tokens`.
+- `Event`: one usage record. Carries `CustomerRequests` (how many customer-billable requests this event represents), zero or more `Meters`, and free-form `Attributes`.
+- `Batch`: a delivery envelope containing multiple events.
+- Header constants for signed-batch transport (`X-Tinfoil-Reporter-Id`, etc.).
+- `IngestionPath`: the controlplane HTTP path that accepts signed batches.
+- Service, operation, and meter name constants (`ServiceRouter`, `OperationRouterModelRequest`, `MeterInputTokens`, ...).
 
 ### `signing`
 
-The `signing` package creates and verifies HMAC-SHA256 signatures for a request body plus request metadata:
-
-- HTTP method
-- request path
-- reporter ID
-- timestamp
-- nonce
-- SHA-256 body hash
-
-Use it on the sender to sign requests and on the receiver to verify them.
+Creates and verifies HMAC-SHA256 signatures over a canonical string built from the request method, path, reporter ID, timestamp, nonce, and SHA-256 body hash. Use it on the sender to sign batch deliveries and on the receiver to verify them.
 
 ### `client`
 
-The `client` package provides `ReporterClient`, which:
+Provides `ReporterClient`, which:
 
 - buffers events in memory
 - periodically flushes them as batches
-- signs each batch request
+- signs each outbound batch
 - drops any batch whose delivery fails (fire-and-forget)
 - flushes remaining events on `Stop`
+
+### `usagecontext`
+
+Lets a service propagate a signed `Context` (root request ID, parent service, customer-request-count) to a downstream service over HTTP headers. Downstream services verify the signature and use the context to decide whether to bill the call as its own customer request or treat it as part of the parent's already-counted request. This is what prevents double-counting when a router fans out to a tool service.
 
 ## Sending events
 
@@ -67,11 +62,8 @@ import (
 
 func main() {
 	reporter := usageclient.New(usageclient.Config{
-		Endpoint: "https://controlplane.example.com/api/internal/usage-reports",
-		Reporter: contract.Reporter{
-			ID:      "router",
-			Service: "router",
-		},
+		Endpoint:      "https://controlplane.example.com" + contract.IngestionPath,
+		ReporterID:    "router-prod-abc123",
 		Secret:        "shared-secret",
 		FlushInterval: 2 * time.Second,
 	})
@@ -80,14 +72,14 @@ func main() {
 	reporter.AddEvent(contract.Event{
 		RequestID: "req_123",
 		Operation: contract.Operation{
-			Service: "router",
-			Name:    "model_request",
+			Service: contract.ServiceRouter,
+			Name:    contract.OperationRouterModelRequest,
 		},
-		APIKey: "sk-example",
+		APIKey:           "sk-example",
+		CustomerRequests: 1,
 		Meters: []contract.Meter{
-			{Name: "input_tokens", Quantity: 120},
-			{Name: "output_tokens", Quantity: 48},
-			{Name: "requests", Quantity: 1},
+			{Name: contract.MeterInputTokens, Quantity: 120},
+			{Name: contract.MeterOutputTokens, Quantity: 48},
 		},
 		Attributes: map[string]string{
 			"model": "gpt-oss-120b",
@@ -97,7 +89,7 @@ func main() {
 }
 ```
 
-If `EventID`, `OccurredAt`, or `Reporter` are omitted, `ReporterClient` fills them in automatically.
+If `EventID` or `OccurredAt` are omitted, `ReporterClient` fills them in automatically.
 
 ## Receiving and verifying batches
 
@@ -145,15 +137,48 @@ func handleUsageBatch(r *http.Request, body []byte, sharedSecret string) error {
 		return err
 	}
 
+	_ = batch
 	return nil
 }
 ```
+
+## Propagating customer-request context
+
+When a parent service (for example a router) calls a downstream tool service that also reports usage, set a signed context on the outgoing request so the downstream emits `customer_requests = 0` and avoids double-counting:
+
+```go
+import "github.com/tinfoilsh/usage-reporting-go/usagecontext"
+
+count := int64(0)
+err := usagecontext.SetHeaders(req.Header, usagecontext.Context{
+	RootRequestID:        "req_123",
+	ParentService:        contract.ServiceRouter,
+	CustomerRequestCount: &count,
+	IssuedAt:             time.Now().UTC(),
+}, contextSigningSecret)
+```
+
+The downstream verifies and reads it:
+
+```go
+ctx, ok, err := usagecontext.FromHeaders(req.Header, contextSigningSecret, time.Now(), 10*time.Minute)
+if err != nil {
+	// header was present but invalid; reject the request rather than fall
+	// through to the direct-billing default.
+}
+customerRequests := int64(1)
+if ok && ctx.CustomerRequestCount != nil && *ctx.CustomerRequestCount >= 0 {
+	customerRequests = *ctx.CustomerRequestCount
+}
+```
+
+A direct customer-facing call (no signed header) bills as its own request. A call dispatched by a parent service bills under the parent.
 
 ## Delivery model
 
 - batching is in-memory
 - each flushed batch gets a `DeliveryID`, which is also used as the signing nonce
 - delivery is fire-and-forget: if a batch fails to send it is logged and dropped
-- `Stop` attempts one final flush of buffered events before returning
+- `Stop` performs a final flush of buffered events before returning
 
 Callers that need durable delivery must layer that on top of this client.
