@@ -115,7 +115,7 @@ func TestFlushRefusesRedirects(t *testing.T) {
 		Meters:    []contract.Meter{{Name: contract.MeterInputTokens, Quantity: 1}},
 	})
 
-	_ = c.Flush(context.Background())
+	c.Flush(context.Background())
 
 	if got := attackerHits.Load(); got != 0 {
 		t.Fatalf("signed telemetry leaked to redirect target: got %d hits, want 0", got)

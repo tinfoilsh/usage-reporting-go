@@ -170,10 +170,11 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 }
 
 // Flush drains buffered events into batches and sends each one. Failed batches
-// are logged and discarded; there is no retry queue.
-func (c *ReporterClient) Flush(ctx context.Context) error {
+// are logged and discarded; there is no retry queue, so callers cannot react
+// to delivery failures.
+func (c *ReporterClient) Flush(ctx context.Context) {
 	if !c.Enabled() {
-		return nil
+		return
 	}
 
 	for _, batch := range c.drainBatches() {
@@ -186,17 +187,14 @@ func (c *ReporterClient) Flush(ctx context.Context) error {
 			)
 		}
 	}
-	return nil
 }
 
-func (c *ReporterClient) Stop(ctx context.Context) error {
-	var err error
+func (c *ReporterClient) Stop(ctx context.Context) {
 	c.stopOnce.Do(func() {
 		close(c.quit)
 		c.wg.Wait()
-		err = c.Flush(ctx)
+		c.Flush(ctx)
 	})
-	return err
 }
 
 func (c *ReporterClient) loop() {
@@ -208,7 +206,7 @@ func (c *ReporterClient) loop() {
 	for {
 		select {
 		case <-ticker.C:
-			_ = c.Flush(context.Background())
+			c.Flush(context.Background())
 		case <-c.quit:
 			return
 		}
