@@ -11,8 +11,11 @@ import (
 func TestSignAndVerify(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
 	ctx := Context{
+		ContextID:           "context-1",
 		RootRequestID:       "request-1",
 		ParentService:       contract.ServiceRouter,
+		APIKeyHash:          HashAPIKey("tk_test"),
+		Depth:               1,
 		BillCustomerRequest: false,
 		IssuedAt:            now,
 	}
@@ -31,6 +34,15 @@ func TestSignAndVerify(t *testing.T) {
 	}
 	if got.ParentService != ctx.ParentService {
 		t.Fatalf("parent service mismatch: got %q want %q", got.ParentService, ctx.ParentService)
+	}
+	if got.ContextID != ctx.ContextID {
+		t.Fatalf("context id mismatch: got %q want %q", got.ContextID, ctx.ContextID)
+	}
+	if got.APIKeyHash != ctx.APIKeyHash {
+		t.Fatalf("api key hash mismatch: got %q want %q", got.APIKeyHash, ctx.APIKeyHash)
+	}
+	if got.Depth != ctx.Depth {
+		t.Fatalf("depth mismatch: got %d want %d", got.Depth, ctx.Depth)
 	}
 	if got.BillCustomerRequest {
 		t.Fatalf("bill_customer_request mismatch: got true want false")
@@ -102,5 +114,21 @@ func TestFromHeadersMissingContext(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("missing headers should report ok=false")
+	}
+}
+
+func TestVerifyAPIKeyHash(t *testing.T) {
+	hash := HashAPIKey("tk_test")
+	if hash == "" {
+		t.Fatal("expected hash")
+	}
+	if !VerifyAPIKeyHash("tk_test", hash) {
+		t.Fatal("expected matching api key hash")
+	}
+	if VerifyAPIKeyHash("tk_other", hash) {
+		t.Fatal("expected mismatched api key hash to fail")
+	}
+	if !VerifyAPIKeyHash("tk_test", "") {
+		t.Fatal("empty expected hash should be treated as not enforced")
 	}
 }
