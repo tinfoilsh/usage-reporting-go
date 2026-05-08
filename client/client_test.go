@@ -50,6 +50,42 @@ func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	}
 }
 
+// TestAddEventEnforcesBufferCeiling guards against unbounded memory growth
+// when the controlplane is unavailable: once MaxBufferedEvents is reached,
+// the oldest event is dropped to make room for the newest.
+func TestAddEventEnforcesBufferCeiling(t *testing.T) {
+	c := New(Config{
+		Endpoint:          "https://example.invalid/usage",
+		ReporterID:        "reporter",
+		Secret:            "secret",
+		MaxBufferedEvents: 3,
+	})
+	defer c.Stop(context.Background())
+
+	for i := 0; i < 5; i++ {
+		c.AddEvent(contract.Event{
+			EventID:   "event-" + string(rune('0'+i)),
+			Operation: contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
+			APIKey:    "sk-test",
+		})
+	}
+
+	batches := c.drainBatches()
+	if len(batches) != 1 {
+		t.Fatalf("expected one batch, got %d", len(batches))
+	}
+	got := batches[0].Events
+	if len(got) != 3 {
+		t.Fatalf("expected ceiling of 3 buffered events, got %d", len(got))
+	}
+	wantIDs := []string{"event-2", "event-3", "event-4"}
+	for i, ev := range got {
+		if ev.EventID != wantIDs[i] {
+			t.Fatalf("event[%d] mismatch: got %q want %q", i, ev.EventID, wantIDs[i])
+		}
+	}
+}
+
 // TestFlushRefusesRedirects verifies the default HTTP client does not follow
 // cross-host redirects, preventing signed telemetry from leaking to a
 // different origin than the one configured.

@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	defaultFlushInterval = 2 * time.Second
-	defaultMaxBatchSize  = 1000
+	defaultFlushInterval     = 2 * time.Second
+	defaultMaxBatchSize      = 1000
+	defaultMaxBufferedEvents = 100_000
 )
 
 type Config struct {
@@ -31,6 +32,12 @@ type Config struct {
 	// MaxBatchSize caps the number of events rolled into a single outbound batch.
 	// Defaults to 1000 when unset or non-positive.
 	MaxBatchSize int
+	// MaxBufferedEvents caps how many events may sit in the in-memory buffer
+	// before AddEvent starts dropping the oldest event to make room for a new
+	// one. Bounds memory growth when the controlplane is unavailable; once the
+	// ceiling is reached, the reporter degrades to "newest events win" rather
+	// than growing without limit. Defaults to 100_000 when unset or non-positive.
+	MaxBufferedEvents int
 }
 
 // ReporterClient batches usage events and delivers them to the controlplane
@@ -38,15 +45,18 @@ type Config struct {
 // logged and dropped. Callers that need durable delivery must layer that on
 // top of this client.
 type ReporterClient struct {
-	endpoint      string
-	reporterID    string
-	secret        string
-	flushInterval time.Duration
-	httpClient    *http.Client
-	maxBatchSize  int
+	endpoint          string
+	reporterID        string
+	secret            string
+	flushInterval     time.Duration
+	httpClient        *http.Client
+	maxBatchSize      int
+	maxBufferedEvents int
 
-	mu      sync.Mutex
-	current []contract.Event
+	mu       sync.Mutex
+	current  []contract.Event
+	dropped  uint64
+	notified uint64
 
 	quit     chan struct{}
 	stopOnce sync.Once
@@ -78,14 +88,20 @@ func New(cfg Config) *ReporterClient {
 		maxBatchSize = defaultMaxBatchSize
 	}
 
+	maxBufferedEvents := cfg.MaxBufferedEvents
+	if maxBufferedEvents <= 0 {
+		maxBufferedEvents = defaultMaxBufferedEvents
+	}
+
 	c := &ReporterClient{
-		endpoint:      strings.TrimRight(cfg.Endpoint, "/"),
-		reporterID:    cfg.ReporterID,
-		secret:        cfg.Secret,
-		flushInterval: interval,
-		httpClient:    httpClient,
-		maxBatchSize:  maxBatchSize,
-		quit:          make(chan struct{}),
+		endpoint:          strings.TrimRight(cfg.Endpoint, "/"),
+		reporterID:        cfg.ReporterID,
+		secret:            cfg.Secret,
+		flushInterval:     interval,
+		httpClient:        httpClient,
+		maxBatchSize:      maxBatchSize,
+		maxBufferedEvents: maxBufferedEvents,
+		quit:              make(chan struct{}),
 	}
 
 	if c.endpoint != "" && c.secret != "" && c.reporterID != "" {
@@ -127,6 +143,28 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 	}
 
 	c.mu.Lock()
+	if len(c.current) >= c.maxBufferedEvents {
+		// Drop the oldest event. The reporter is fire-and-forget, so the most
+		// useful behaviour under sustained backpressure is to keep the freshest
+		// telemetry and surface that drops occurred.
+		copy(c.current, c.current[1:])
+		c.current[len(c.current)-1] = event
+		c.dropped++
+		dropped := c.dropped
+		shouldLog := dropped == 1 || dropped-c.notified >= 1000
+		if shouldLog {
+			c.notified = dropped
+		}
+		c.mu.Unlock()
+		if shouldLog {
+			slog.Warn("usage reporter buffer full; dropped oldest event",
+				"reporter_id", c.reporterID,
+				"max_buffered_events", c.maxBufferedEvents,
+				"total_dropped", dropped,
+			)
+		}
+		return
+	}
 	c.current = append(c.current, event)
 	c.mu.Unlock()
 }
