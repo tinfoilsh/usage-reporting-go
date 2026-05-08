@@ -24,23 +24,20 @@ type Meter struct {
 	Quantity int64  `json:"quantity"`
 }
 
-const CounterCustomerRequests = "customer_requests"
-
-type Counter struct {
-	Name     string `json:"name"`
-	Quantity int64  `json:"quantity"`
-}
-
 type Event struct {
-	EventID    string            `json:"event_id"`
-	RequestID  string            `json:"request_id,omitempty"`
-	OccurredAt time.Time         `json:"occurred_at"`
-	Reporter   Reporter          `json:"reporter"`
-	Operation  Operation         `json:"operation"`
-	APIKey     string            `json:"api_key,omitempty"`
-	Meters     []Meter           `json:"meters"`
-	Counters   []Counter         `json:"counters,omitempty"`
-	Attributes map[string]string `json:"attributes,omitempty"`
+	EventID    string    `json:"event_id"`
+	RequestID  string    `json:"request_id,omitempty"`
+	OccurredAt time.Time `json:"occurred_at"`
+	Reporter   Reporter  `json:"reporter"`
+	Operation  Operation `json:"operation"`
+	APIKey     string    `json:"api_key,omitempty"`
+	// CustomerRequests records how many customer-billable requests this event
+	// represents. Leaf services invoked inside another service's request (for
+	// example a tool call dispatched by the router) emit 0 so the parent
+	// request is counted exactly once at the edge.
+	CustomerRequests int64             `json:"customer_requests,omitempty"`
+	Meters           []Meter           `json:"meters"`
+	Attributes       map[string]string `json:"attributes,omitempty"`
 }
 
 type Batch struct {

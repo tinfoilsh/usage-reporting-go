@@ -11,8 +11,8 @@ import (
 )
 
 // TestAddEventSnapshotsReferenceFields guards against a caller mutating
-// the Meters slice, Counters slice, or Attributes map of an event after
-// AddEvent returns and seeing that mutation reflected in the queued telemetry.
+// the Meters slice or Attributes map of an event after AddEvent returns
+// and seeing that mutation reflected in the queued telemetry.
 func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	c := New(Config{
 		Endpoint: "https://example.invalid/usage",
@@ -22,18 +22,16 @@ func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	defer c.Stop(context.Background())
 
 	meters := []contract.Meter{{Name: "input_tokens", Quantity: 10}}
-	counters := []contract.Counter{{Name: contract.CounterCustomerRequests, Quantity: 1}}
 	attrs := map[string]string{"model": "gpt-oss-120b"}
 	c.AddEvent(contract.Event{
-		Operation:  contract.Operation{Service: "router", Name: "model_request"},
-		APIKey:     "sk-test",
-		Meters:     meters,
-		Counters:   counters,
-		Attributes: attrs,
+		Operation:        contract.Operation{Service: "router", Name: "model_request"},
+		APIKey:           "sk-test",
+		CustomerRequests: 1,
+		Meters:           meters,
+		Attributes:       attrs,
 	})
 
 	meters[0].Quantity = 999
-	counters[0].Quantity = 999
 	attrs["model"] = "attacker-controlled"
 
 	batches := c.drainBatches()
@@ -44,8 +42,8 @@ func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	if got.Meters[0].Quantity != 10 {
 		t.Fatalf("meter quantity was mutated after AddEvent: got %d want 10", got.Meters[0].Quantity)
 	}
-	if got.Counters[0].Quantity != 1 {
-		t.Fatalf("counter quantity was mutated after AddEvent: got %d want %d", got.Counters[0].Quantity, 1)
+	if got.CustomerRequests != 1 {
+		t.Fatalf("customer requests was mutated after AddEvent: got %d want 1", got.CustomerRequests)
 	}
 	if got.Attributes["model"] != "gpt-oss-120b" {
 		t.Fatalf("attribute was mutated after AddEvent: got %q want %q", got.Attributes["model"], "gpt-oss-120b")
