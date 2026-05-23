@@ -13,8 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/tinfoilsh/usage-reporting-go/contract"
-	"github.com/tinfoilsh/usage-reporting-go/signing"
+	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 )
 
 const (
@@ -57,7 +56,7 @@ type ReporterClient struct {
 	// ring is a fixed-capacity ring buffer holding queued events. head points
 	// at the oldest event, size tracks how many slots are populated. A full
 	// buffer drops the oldest event in O(1) by advancing head.
-	ring     []contract.Event
+	ring     []usagereporting.Event
 	head     int
 	size     int
 	dropped  uint64
@@ -106,7 +105,7 @@ func New(cfg Config) *ReporterClient {
 		httpClient:        httpClient,
 		maxBatchSize:      maxBatchSize,
 		maxBufferedEvents: maxBufferedEvents,
-		ring:              make([]contract.Event, maxBufferedEvents),
+		ring:              make([]usagereporting.Event, maxBufferedEvents),
 		quit:              make(chan struct{}),
 	}
 
@@ -122,7 +121,7 @@ func (c *ReporterClient) Enabled() bool {
 	return c.endpoint != "" && c.secret != "" && c.reporterID != ""
 }
 
-func (c *ReporterClient) AddEvent(event contract.Event) {
+func (c *ReporterClient) AddEvent(event usagereporting.Event) {
 	if !c.Enabled() {
 		return
 	}
@@ -136,7 +135,7 @@ func (c *ReporterClient) AddEvent(event contract.Event) {
 	// Snapshot reference-typed fields so later caller mutations of the meter
 	// slice or attribute map cannot corrupt queued telemetry.
 	if len(event.Meters) > 0 {
-		meters := make([]contract.Meter, len(event.Meters))
+		meters := make([]usagereporting.Meter, len(event.Meters))
 		copy(meters, event.Meters)
 		event.Meters = meters
 	}
@@ -222,7 +221,7 @@ func (c *ReporterClient) loop() {
 
 // drainBatches moves queued events into one or more outbound batches sized at
 // most maxBatchSize, reading them out of the ring buffer in FIFO order.
-func (c *ReporterClient) drainBatches() []*contract.Batch {
+func (c *ReporterClient) drainBatches() []*usagereporting.Batch {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.size == 0 {
@@ -231,22 +230,22 @@ func (c *ReporterClient) drainBatches() []*contract.Batch {
 
 	ringCap := len(c.ring)
 	total := c.size
-	batches := make([]*contract.Batch, 0, (total+c.maxBatchSize-1)/c.maxBatchSize)
+	batches := make([]*usagereporting.Batch, 0, (total+c.maxBatchSize-1)/c.maxBatchSize)
 	for emitted := 0; emitted < total; {
 		remaining := total - emitted
 		batchSize := c.maxBatchSize
 		if remaining < batchSize {
 			batchSize = remaining
 		}
-		events := make([]contract.Event, batchSize)
+		events := make([]usagereporting.Event, batchSize)
 		for i := 0; i < batchSize; i++ {
 			idx := (c.head + emitted + i) % ringCap
 			events[i] = c.ring[idx]
 			// Release the slot so any references it holds can be GC'd while
 			// the batch is in flight.
-			c.ring[idx] = contract.Event{}
+			c.ring[idx] = usagereporting.Event{}
 		}
-		batches = append(batches, &contract.Batch{
+		batches = append(batches, &usagereporting.Batch{
 			DeliveryID: uuid.NewString(),
 			Events:     events,
 		})
@@ -257,7 +256,7 @@ func (c *ReporterClient) drainBatches() []*contract.Batch {
 	return batches
 }
 
-func (c *ReporterClient) sendBatch(ctx context.Context, batch *contract.Batch) error {
+func (c *ReporterClient) sendBatch(ctx context.Context, batch *usagereporting.Batch) error {
 	body, err := json.Marshal(batch)
 	if err != nil {
 		return fmt.Errorf("marshal usage batch: %w", err)
@@ -270,13 +269,13 @@ func (c *ReporterClient) sendBatch(ctx context.Context, batch *contract.Batch) e
 
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	nonce := batch.DeliveryID
-	signature := signing.Sign(http.MethodPost, req.URL.Path, c.reporterID, timestamp, nonce, body, c.secret)
+	signature := usagereporting.SignBatch(http.MethodPost, req.URL.Path, c.reporterID, timestamp, nonce, body, c.secret)
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(contract.HeaderReporterID, c.reporterID)
-	req.Header.Set(contract.HeaderTimestamp, timestamp)
-	req.Header.Set(contract.HeaderNonce, nonce)
-	req.Header.Set(contract.HeaderSignature, signature)
+	req.Header.Set(usagereporting.HeaderReporterID, c.reporterID)
+	req.Header.Set(usagereporting.HeaderTimestamp, timestamp)
+	req.Header.Set(usagereporting.HeaderNonce, nonce)
+	req.Header.Set(usagereporting.HeaderSignature, signature)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
