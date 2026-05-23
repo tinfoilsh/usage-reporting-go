@@ -21,20 +21,11 @@ const (
 	ServiceBuckets   = "buckets"
 )
 
-// Operation names for known services. Operations are always scoped by service,
-// so the same name (for example a hypothetical "session") can mean different
-// things across services.
+// Operation names that the controlplane recognizes.
+// An op belongs here iff the controlplane needs to branch on it
 const (
 	OperationRouterModelRequest = "model_request"
-
-	OperationWebsearchSession = "session"
-
-	OperationBucketsPutObject    = "put_object"
-	OperationBucketsGetObject    = "get_object"
-	OperationBucketsHeadObject   = "head_object"
-	OperationBucketsDeleteObject = "delete_object"
-	OperationBucketsAddKey       = "add_key"
-	OperationBucketsRemoveKey    = "remove_key"
+	OperationWebsearchSession   = "session"
 )
 
 // Meter names. Pricing for a meter is keyed by (service, operation, name)
@@ -47,6 +38,7 @@ const (
 type Operation struct {
 	Service string `json:"service"`
 	Name    string `json:"name"`
+	Class   string `json:"class,omitempty"` // Optional, tier-based
 }
 
 type Meter struct {

@@ -4,10 +4,17 @@
 
 It provides:
 
-- a shared event contract in `contract`
-- HMAC signing helpers in `signing`
-- a batching background reporter in `client`
-- signed request-context propagation in `usagecontext`
+- the wire contract — event/operation/batch types, header names, ingestion path
+- HMAC signing helpers (`SignBatch` / `VerifyBatch`)
+- signed request-context propagation (`SignContext` / `VerifyContext`)
+- a batching background reporter in the `client` subpackage
+
+## Layout
+
+The module is split into two packages:
+
+- root `usagereporting` — wire surface. Types both sides agree on (`Event`, `Operation`, `Batch`, `Meter`), header constants, signing helpers, usage-context machinery.
+- `client/` — the emitter (`ReporterClient`, `Config`, `New`).
 
 ## Install
 
@@ -15,13 +22,22 @@ It provides:
 go get github.com/tinfoilsh/usage-reporting-go@latest
 ```
 
+## Billing models
+
+The controlplane supports two pricing modes per event, chosen via `Operation`:
+
+1. **Per-operation pricing** — controlplane prices on `(service, name)`. The default.
+2. **Class-based pricing** — set `Operation.Class` to opt in. Controlplane prices on `(service, class)` and ignores `Name` for pricing. `Name` remains the granular audit label persisted with every event.
+
 ## Packages
 
-### `contract`
+### root — `usagereporting`
 
-Defines the wire format and the well-known identifiers used across reporters and the controlplane:
+The wire surface. Imported by both emitters and the controlplane.
 
-- `Operation`: the action being measured, scoped by service (`Service` + `Name`).
+**Contract** — the wire format and the well-known identifiers used across reporters and the controlplane:
+
+- `Operation`: the action being measured, scoped by service (`Service` + `Name`, with optional `Class` for tier pricing).
 - `Meter`: a named integer quantity such as `input_tokens` or `output_tokens`.
 - `Event`: one usage record. Carries `CustomerRequests` (how many customer-billable requests this event represents), zero or more `Meters`, and free-form `Attributes`.
 - `Batch`: a delivery envelope containing multiple events.
@@ -29,23 +45,15 @@ Defines the wire format and the well-known identifiers used across reporters and
 - `IngestionPath`: the controlplane HTTP path that accepts signed batches.
 - Service, operation, and meter name constants (`ServiceRouter`, `OperationRouterModelRequest`, `MeterInputTokens`, ...).
 
-### `signing`
+**Signing** — `SignBatch` / `VerifyBatch` produce and verify HMAC-SHA256 signatures over a canonical string built from method, path, reporter ID, timestamp, nonce, and SHA-256 body hash. `HeaderValues` extracts the four signing headers from an incoming request.
 
-Creates and verifies HMAC-SHA256 signatures over a canonical string built from the request method, path, reporter ID, timestamp, nonce, and SHA-256 body hash. Use it on the sender to sign batch deliveries and on the receiver to verify them.
+**Usage context** — `SignContext` / `VerifyContext` and `SetHeaders` / `FromHeaders` propagate a signed `Context` (root request ID, parent service, billing decision) to a downstream service over HTTP headers. Downstream services verify the signature and use it to decide whether to bill the call as their own customer request or treat it as part of the parent's already-counted request — this is what prevents double-counting when a router fans out to a tool service.
 
-### `client`
+### `client/`
 
-Provides `ReporterClient`, which:
+The in-process batching emitter. Imported only by services that emit events; the controlplane never imports this.
 
-- buffers events in memory
-- periodically flushes them as batches
-- signs each outbound batch
-- drops any batch whose delivery fails (fire-and-forget)
-- flushes remaining events on `Stop`
-
-### `usagecontext`
-
-Lets a service propagate a signed `Context` (root request ID, parent service, billing decision) to a downstream service over HTTP headers. Downstream services verify the signature and use the context to decide whether to bill the call as its own customer request or treat it as part of the parent's already-counted request. This is what prevents double-counting when a router fans out to a tool service.
+`ReporterClient` (via `New(Config{...})`) buffers events in memory, periodically flushes them as signed batches, drops any batch whose delivery fails (fire-and-forget), and performs a final flush on `Stop`.
 
 ## Sending events
 
@@ -56,35 +64,48 @@ import (
 	"context"
 	"time"
 
+	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 	usageclient "github.com/tinfoilsh/usage-reporting-go/client"
-	"github.com/tinfoilsh/usage-reporting-go/contract"
 )
 
 func main() {
 	reporter := usageclient.New(usageclient.Config{
-		Endpoint:      "https://controlplane.example.com" + contract.IngestionPath,
+		Endpoint:      "https://controlplane.example.com" + usagereporting.IngestionPath,
 		ReporterID:    "router-prod-abc123",
 		Secret:        "shared-secret",
 		FlushInterval: 2 * time.Second,
 	})
 	defer reporter.Stop(context.Background())
 
-	reporter.AddEvent(contract.Event{
+	// Per-operation pricing (token-metered model request).
+	reporter.AddEvent(usagereporting.Event{
 		RequestID: "req_123",
-		Operation: contract.Operation{
-			Service: contract.ServiceRouter,
-			Name:    contract.OperationRouterModelRequest,
+		Operation: usagereporting.Operation{
+			Service: usagereporting.ServiceRouter,
+			Name:    usagereporting.OperationRouterModelRequest,
 		},
 		APIKey:           "sk-example",
 		CustomerRequests: 1,
-		Meters: []contract.Meter{
-			{Name: contract.MeterInputTokens, Quantity: 120},
-			{Name: contract.MeterOutputTokens, Quantity: 48},
+		Meters: []usagereporting.Meter{
+			{Name: usagereporting.MeterInputTokens, Quantity: 120},
+			{Name: usagereporting.MeterOutputTokens, Quantity: 48},
 		},
 		Attributes: map[string]string{
 			"model": "gpt-oss-120b",
 			"route": "/v1/chat/completions",
 		},
+	})
+
+	// Class-based pricing (flat per-request, class shared across many ops).
+	reporter.AddEvent(usagereporting.Event{
+		RequestID: "req_456",
+		Operation: usagereporting.Operation{
+			Service: usagereporting.ServiceBuckets,
+			Name:    "put_object", // granular audit label, emitter-defined
+			Class:   "a",          // billing key
+		},
+		APIKey:           "sk-example",
+		CustomerRequests: 1,
 	})
 }
 ```
@@ -99,7 +120,7 @@ On the receiving side:
 2. extract `X-Tinfoil-*` signing headers
 3. verify the signature with the shared secret
 4. enforce timestamp skew and reject any batch whose `delivery_id` (used as the signing nonce) has already been seen, to prevent replay
-5. unmarshal the body into `contract.Batch`
+5. unmarshal the body into `usagereporting.Batch`
 6. process the batch atomically if you need retry-safe ingestion
 
 The library only signs and verifies; the receiver is responsible for tracking recently-seen `delivery_id` values within the timestamp skew window.
@@ -112,17 +133,16 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/tinfoilsh/usage-reporting-go/contract"
-	"github.com/tinfoilsh/usage-reporting-go/signing"
+	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 )
 
 func handleUsageBatch(r *http.Request, body []byte, sharedSecret string) error {
-	reporterID, timestamp, nonce, signature, err := signing.HeaderValues(r.Header)
+	reporterID, timestamp, nonce, signature, err := usagereporting.HeaderValues(r.Header)
 	if err != nil {
 		return err
 	}
 
-	if !signing.Verify(
+	if !usagereporting.VerifyBatch(
 		r.Method,
 		r.URL.Path,
 		reporterID,
@@ -135,7 +155,7 @@ func handleUsageBatch(r *http.Request, body []byte, sharedSecret string) error {
 		return fmt.Errorf("invalid signature")
 	}
 
-	var batch contract.Batch
+	var batch usagereporting.Batch
 	if err := json.Unmarshal(body, &batch); err != nil {
 		return err
 	}
@@ -150,11 +170,9 @@ func handleUsageBatch(r *http.Request, body []byte, sharedSecret string) error {
 When a parent service (for example a router) calls a downstream tool service that also reports usage, set a signed context on the outgoing request so the downstream emits `customer_requests = 0` and avoids double-counting:
 
 ```go
-import "github.com/tinfoilsh/usage-reporting-go/usagecontext"
-
-err := usagecontext.SetHeaders(req.Header, usagecontext.Context{
+err := usagereporting.SetHeaders(req.Header, usagereporting.Context{
 	RootRequestID:       "req_123",
-	ParentService:       contract.ServiceRouter,
+	ParentService:       usagereporting.ServiceRouter,
 	BillCustomerRequest: false,
 	IssuedAt:            time.Now().UTC(),
 }, contextSigningSecret)
@@ -163,7 +181,7 @@ err := usagecontext.SetHeaders(req.Header, usagecontext.Context{
 The downstream verifies and reads it:
 
 ```go
-ctx, ok, err := usagecontext.FromHeaders(req.Header, contextSigningSecret, time.Now(), 10*time.Minute)
+ctx, ok, err := usagereporting.FromHeaders(req.Header, contextSigningSecret, time.Now(), 10*time.Minute)
 if err != nil {
 	// header was present but invalid; reject the request rather than fall
 	// through to the direct-billing default.
