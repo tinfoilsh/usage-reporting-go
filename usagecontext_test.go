@@ -1,11 +1,10 @@
-package usagecontext
+package usagereporting
 
 import (
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/tinfoilsh/usage-reporting-go/contract"
 )
 
 func TestSignAndVerify(t *testing.T) {
@@ -13,19 +12,19 @@ func TestSignAndVerify(t *testing.T) {
 	ctx := Context{
 		ContextID:           "context-1",
 		RootRequestID:       "request-1",
-		ParentService:       contract.ServiceRouter,
+		ParentService:       ServiceRouter,
 		APIKeyHash:          HashAPIKey("tk_test"),
 		Depth:               1,
 		BillCustomerRequest: false,
 		IssuedAt:            now,
 	}
 
-	encoded, signature, err := Sign(ctx, "secret")
+	encoded, signature, err := SignContext(ctx, "secret")
 	if err != nil {
 		t.Fatalf("sign usage context: %v", err)
 	}
 
-	got, err := Verify(encoded, signature, "secret", now, time.Minute)
+	got, err := VerifyContext(encoded, signature, "secret", now, time.Minute)
 	if err != nil {
 		t.Fatalf("verify usage context: %v", err)
 	}
@@ -51,7 +50,7 @@ func TestSignAndVerify(t *testing.T) {
 
 func TestVerifyRejectsTampering(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	encoded, signature, err := Sign(Context{
+	encoded, signature, err := SignContext(Context{
 		RootRequestID:       "request-1",
 		BillCustomerRequest: true,
 		IssuedAt:            now,
@@ -60,17 +59,17 @@ func TestVerifyRejectsTampering(t *testing.T) {
 		t.Fatalf("sign usage context: %v", err)
 	}
 
-	if _, err := Verify(encoded+"a", signature, "secret", now, time.Minute); err == nil {
+	if _, err := VerifyContext(encoded+"a", signature, "secret", now, time.Minute); err == nil {
 		t.Fatal("expected tampered context to fail verification")
 	}
-	if _, err := Verify(encoded, signature, "wrong-secret", now, time.Minute); err == nil {
+	if _, err := VerifyContext(encoded, signature, "wrong-secret", now, time.Minute); err == nil {
 		t.Fatal("expected wrong secret to fail verification")
 	}
 }
 
 func TestVerifyRejectsStaleContext(t *testing.T) {
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	encoded, signature, err := Sign(Context{
+	encoded, signature, err := SignContext(Context{
 		RootRequestID: "request-1",
 		IssuedAt:      now.Add(-2 * time.Minute),
 	}, "secret")
@@ -78,7 +77,7 @@ func TestVerifyRejectsStaleContext(t *testing.T) {
 		t.Fatalf("sign usage context: %v", err)
 	}
 
-	if _, err := Verify(encoded, signature, "secret", now, time.Minute); err == nil {
+	if _, err := VerifyContext(encoded, signature, "secret", now, time.Minute); err == nil {
 		t.Fatal("expected stale context to fail verification")
 	}
 }
@@ -88,7 +87,7 @@ func TestHeadersRoundTrip(t *testing.T) {
 	header := make(http.Header)
 	if err := SetHeaders(header, Context{
 		RootRequestID:       "request-1",
-		ParentService:       contract.ServiceRouter,
+		ParentService:       ServiceRouter,
 		BillCustomerRequest: false,
 		IssuedAt:            now,
 	}, "secret"); err != nil {

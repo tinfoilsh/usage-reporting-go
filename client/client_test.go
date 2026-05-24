@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/tinfoilsh/usage-reporting-go/contract"
+	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 )
 
 // TestAddEventSnapshotsReferenceFields guards against a caller mutating
@@ -23,10 +23,10 @@ func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	})
 	defer c.Stop(context.Background())
 
-	meters := []contract.Meter{{Name: contract.MeterInputTokens, Quantity: 10}}
+	meters := []usagereporting.Meter{{Name: usagereporting.MeterInputTokens, Quantity: 10}}
 	attrs := map[string]string{"model": "gpt-oss-120b"}
-	c.AddEvent(contract.Event{
-		Operation:        contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
+	c.AddEvent(usagereporting.Event{
+		Operation:        usagereporting.Operation{Service: usagereporting.ServiceRouter, Name: usagereporting.OperationRouterModelRequest},
 		APIKey:           "sk-test",
 		CustomerRequests: 1,
 		Meters:           meters,
@@ -65,9 +65,9 @@ func TestAddEventEnforcesBufferCeiling(t *testing.T) {
 	defer c.Stop(context.Background())
 
 	for i := 0; i < 5; i++ {
-		c.AddEvent(contract.Event{
+		c.AddEvent(usagereporting.Event{
 			EventID:   "event-" + string(rune('0'+i)),
-			Operation: contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
+			Operation: usagereporting.Operation{Service: usagereporting.ServiceRouter, Name: usagereporting.OperationRouterModelRequest},
 			APIKey:    "sk-test",
 		})
 	}
@@ -111,9 +111,9 @@ func TestAddEventConcurrentAtCapacity(t *testing.T) {
 		go func(writer int) {
 			defer wg.Done()
 			for i := 0; i < perWriter; i++ {
-				c.AddEvent(contract.Event{
+				c.AddEvent(usagereporting.Event{
 					EventID:   fmt.Sprintf("w%d-i%d", writer, i),
-					Operation: contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
+					Operation: usagereporting.Operation{Service: usagereporting.ServiceRouter, Name: usagereporting.OperationRouterModelRequest},
 					APIKey:    "sk-test",
 				})
 			}
@@ -161,10 +161,10 @@ func TestFlushRefusesRedirects(t *testing.T) {
 	})
 	defer c.Stop(context.Background())
 
-	c.AddEvent(contract.Event{
-		Operation: contract.Operation{Service: contract.ServiceRouter, Name: contract.OperationRouterModelRequest},
+	c.AddEvent(usagereporting.Event{
+		Operation: usagereporting.Operation{Service: usagereporting.ServiceRouter, Name: usagereporting.OperationRouterModelRequest},
 		APIKey:    "sk-test",
-		Meters:    []contract.Meter{{Name: contract.MeterInputTokens, Quantity: 1}},
+		Meters:    []usagereporting.Meter{{Name: usagereporting.MeterInputTokens, Quantity: 1}},
 	})
 
 	c.Flush(context.Background())

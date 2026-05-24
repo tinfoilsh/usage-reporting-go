@@ -1,4 +1,4 @@
-package usagecontext
+package usagereporting
 
 import (
 	"crypto/hmac"
@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	HeaderContext   = "X-Tinfoil-Usage-Context"
-	HeaderSignature = "X-Tinfoil-Usage-Context-Signature"
+	HeaderContext                = "X-Tinfoil-Usage-Context"
+	HeaderUsageContextSignature  = "X-Tinfoil-Usage-Context-Signature"
 
 	signatureDomain = "tinfoil-usage-context-v1:"
 )
@@ -35,7 +35,7 @@ type Context struct {
 	IssuedAt            time.Time `json:"issued_at"`
 }
 
-func Sign(ctx Context, secret string) (encoded, signature string, err error) {
+func SignContext(ctx Context, secret string) (encoded, signature string, err error) {
 	if strings.TrimSpace(secret) == "" {
 		return "", "", fmt.Errorf("usage context secret is empty")
 	}
@@ -47,7 +47,7 @@ func Sign(ctx Context, secret string) (encoded, signature string, err error) {
 	return encoded, signEncoded(encoded, secret), nil
 }
 
-func Verify(encoded, signature, secret string, now time.Time, maxSkew time.Duration) (Context, error) {
+func VerifyContext(encoded, signature, secret string, now time.Time, maxSkew time.Duration) (Context, error) {
 	if strings.TrimSpace(secret) == "" {
 		return Context{}, fmt.Errorf("usage context secret is empty")
 	}
@@ -76,25 +76,25 @@ func Verify(encoded, signature, secret string, now time.Time, maxSkew time.Durat
 }
 
 func SetHeaders(header http.Header, ctx Context, secret string) error {
-	encoded, signature, err := Sign(ctx, secret)
+	encoded, signature, err := SignContext(ctx, secret)
 	if err != nil {
 		return err
 	}
 	header.Set(HeaderContext, encoded)
-	header.Set(HeaderSignature, signature)
+	header.Set(HeaderUsageContextSignature, signature)
 	return nil
 }
 
 func FromHeaders(header http.Header, secret string, now time.Time, maxSkew time.Duration) (Context, bool, error) {
 	encoded := strings.TrimSpace(header.Get(HeaderContext))
-	signature := strings.TrimSpace(header.Get(HeaderSignature))
+	signature := strings.TrimSpace(header.Get(HeaderUsageContextSignature))
 	if encoded == "" && signature == "" {
 		return Context{}, false, nil
 	}
 	if encoded == "" || signature == "" {
 		return Context{}, true, fmt.Errorf("usage context and signature must both be present")
 	}
-	ctx, err := Verify(encoded, signature, secret, now, maxSkew)
+	ctx, err := VerifyContext(encoded, signature, secret, now, maxSkew)
 	return ctx, true, err
 }
 
