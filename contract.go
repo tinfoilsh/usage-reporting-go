@@ -34,9 +34,9 @@ const (
 	MeterInputTokens  = "input_tokens"
 	MeterOutputTokens = "output_tokens"
 	// MeterCachedInputTokens is the subset of MeterInputTokens that the model
-	// served from its prompt cache. The uncached portion is the receiver's
-	// derivation MeterInputTokens - MeterCachedInputTokens; reporters emit only
-	// the total and the cached subset.
+	// served from its prompt cache. The receiver derives the uncached portion as
+	// MeterInputTokens - MeterCachedInputTokens; reporters emit only the total and
+	// the cached subset.
 	MeterCachedInputTokens = "cached_input_tokens"
 )
 
