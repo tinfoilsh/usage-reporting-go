@@ -7,8 +7,8 @@ import (
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
-	"time"
 	"testing"
+	"time"
 
 	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 )
@@ -121,6 +121,10 @@ func TestAddEventConcurrentAtCapacity(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+
+	if s := c.Stats(); s != (Stats{Enqueued: writers * perWriter, DroppedBufferFull: writers*perWriter - cap}) {
+		t.Fatalf("concurrent overflow accounting mismatch: %+v", s)
+	}
 
 	batches := c.drainBatches()
 	total := 0
