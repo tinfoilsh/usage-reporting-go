@@ -65,6 +65,59 @@ type ReporterClient struct {
 	quit     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	stats reporterCounters // Guarded by mu along with the buffer.
+}
+
+// reporterCounters holds monotonic event-accounting counters. They exist so a
+// caller can export end-to-end delivery accounting (e.g. as Prometheus
+// counters): every event handed to AddEvent lands in exactly one of
+// enqueued/droppedDisabled, and every enqueued event eventually lands in
+// exactly one of deliveredEvents/failedEvents/droppedBufferFull (or remains
+// buffered or in flight).
+type reporterCounters struct {
+	enqueued          uint64
+	droppedDisabled   uint64
+	droppedBufferFull uint64
+	deliveredEvents   uint64
+	deliveredBatches  uint64
+	failedEvents      uint64
+	failedBatches     uint64
+}
+
+// Stats is a point-in-time snapshot of the reporter's monotonic accounting
+// counters.
+type Stats struct {
+	// Enqueued counts events accepted into the buffer.
+	Enqueued uint64
+	// DroppedDisabled counts events discarded because the reporter was not
+	// configured (missing endpoint, secret, or reporter ID).
+	DroppedDisabled uint64
+	// DroppedBufferFull counts oldest events overwritten on buffer overflow.
+	DroppedBufferFull uint64
+	// DeliveredEvents / DeliveredBatches count events and batches acknowledged
+	// with an HTTP 2xx.
+	DeliveredEvents  uint64
+	DeliveredBatches uint64
+	// FailedEvents / FailedBatches count events and batches discarded after a
+	// delivery failure (there is no retry).
+	FailedEvents  uint64
+	FailedBatches uint64
+}
+
+// Stats returns a snapshot of the reporter's delivery accounting.
+func (c *ReporterClient) Stats() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Stats{
+		Enqueued:          c.stats.enqueued,
+		DroppedDisabled:   c.stats.droppedDisabled,
+		DroppedBufferFull: c.stats.droppedBufferFull,
+		DeliveredEvents:   c.stats.deliveredEvents,
+		DeliveredBatches:  c.stats.deliveredBatches,
+		FailedEvents:      c.stats.failedEvents,
+		FailedBatches:     c.stats.failedBatches,
+	}
 }
 
 func New(cfg Config) *ReporterClient {
@@ -123,6 +176,9 @@ func (c *ReporterClient) Enabled() bool {
 
 func (c *ReporterClient) AddEvent(event usagereporting.Event) {
 	if !c.Enabled() {
+		c.mu.Lock()
+		c.stats.droppedDisabled++
+		c.mu.Unlock()
 		return
 	}
 	if event.EventID == "" {
@@ -148,6 +204,7 @@ func (c *ReporterClient) AddEvent(event usagereporting.Event) {
 	}
 
 	c.mu.Lock()
+	c.stats.enqueued++
 	ringCap := len(c.ring)
 	if c.size < ringCap {
 		c.ring[(c.head+c.size)%ringCap] = event
@@ -159,6 +216,7 @@ func (c *ReporterClient) AddEvent(event usagereporting.Event) {
 	// forget telemetry favours freshness over completeness under backpressure.
 	c.ring[c.head] = event
 	c.head = (c.head + 1) % ringCap
+	c.stats.droppedBufferFull++
 	c.dropped++
 	dropped := c.dropped
 	shouldLog := dropped == 1 || dropped-c.notified >= 1000
@@ -185,12 +243,21 @@ func (c *ReporterClient) Flush(ctx context.Context) {
 
 	for _, batch := range c.drainBatches() {
 		if err := c.sendBatch(ctx, batch); err != nil {
+			c.mu.Lock()
+			c.stats.failedEvents += uint64(len(batch.Events))
+			c.stats.failedBatches++
+			c.mu.Unlock()
 			slog.Warn("usage reporter dropped batch",
 				"reporter_id", c.reporterID,
 				"delivery_id", batch.DeliveryID,
 				"events", len(batch.Events),
 				"error", err,
 			)
+		} else {
+			c.mu.Lock()
+			c.stats.deliveredEvents += uint64(len(batch.Events))
+			c.stats.deliveredBatches++
+			c.mu.Unlock()
 		}
 	}
 }

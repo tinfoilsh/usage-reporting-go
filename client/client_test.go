@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 )
@@ -121,6 +122,10 @@ func TestAddEventConcurrentAtCapacity(t *testing.T) {
 	}
 	wg.Wait()
 
+	if s := c.Stats(); s != (Stats{Enqueued: writers * perWriter, DroppedBufferFull: writers*perWriter - cap}) {
+		t.Fatalf("concurrent overflow accounting mismatch: %+v", s)
+	}
+
 	batches := c.drainBatches()
 	total := 0
 	seen := make(map[string]struct{})
@@ -171,5 +176,51 @@ func TestFlushRefusesRedirects(t *testing.T) {
 
 	if got := attackerHits.Load(); got != 0 {
 		t.Fatalf("signed telemetry leaked to redirect target: got %d hits, want 0", got)
+	}
+}
+
+func TestStatsAccounting(t *testing.T) {
+	var mode atomic.Int32 // 0 = accept, 1 = fail
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mode.Load() == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := New(Config{
+		Endpoint:      server.URL + "/usage",
+		ReporterID:    "reporter",
+		Secret:        "secret",
+		FlushInterval: time.Hour, // flush manually
+	})
+	defer c.Stop(context.Background())
+
+	event := usagereporting.Event{
+		Operation:        usagereporting.Operation{Service: usagereporting.ServiceRouter, Name: usagereporting.OperationRouterModelRequest},
+		APIKey:           "sk-test",
+		CustomerRequests: 1,
+	}
+
+	c.AddEvent(event)
+	c.AddEvent(event)
+	c.Flush(context.Background())
+
+	mode.Store(1)
+	c.AddEvent(event)
+	c.Flush(context.Background())
+
+	got := c.Stats()
+	want := Stats{Enqueued: 3, DeliveredEvents: 2, DeliveredBatches: 1, FailedEvents: 1, FailedBatches: 1}
+	if got != want {
+		t.Fatalf("stats mismatch: got %+v want %+v", got, want)
+	}
+
+	disabled := New(Config{})
+	disabled.AddEvent(event)
+	if s := disabled.Stats(); s.DroppedDisabled != 1 || s.Enqueued != 0 {
+		t.Fatalf("disabled stats mismatch: %+v", s)
 	}
 }
