@@ -19,6 +19,7 @@ const (
 	ServiceRouter    = "router"
 	ServiceWebsearch = "websearch"
 	ServiceBuckets   = "buckets"
+	ServicePIIFilter = "pii-filter"
 )
 
 // Operation names that the controlplane recognizes.
@@ -26,6 +27,7 @@ const (
 const (
 	OperationRouterModelRequest = "model_request"
 	OperationWebsearchSession   = "session"
+	OperationPIIFilterRedact    = "redact"
 )
 
 // Meter names. Pricing for a meter is keyed by (service, operation, name)
