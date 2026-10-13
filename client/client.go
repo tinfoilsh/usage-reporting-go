@@ -241,7 +241,19 @@ func (c *ReporterClient) Flush(ctx context.Context) {
 		return
 	}
 
-	for _, batch := range c.drainBatches() {
+	// Drain one batch at a time so events waiting behind an in-flight batch
+	// stay in the ring, where MaxBufferedEvents bounds them. Stopping at the
+	// count buffered on entry keeps a steady stream of new events from
+	// extending the flush indefinitely.
+	c.mu.Lock()
+	remaining := c.size
+	c.mu.Unlock()
+	for remaining > 0 {
+		batch := c.drainBatch(remaining)
+		if batch == nil {
+			return
+		}
+		remaining -= len(batch.Events)
 		if err := c.sendBatch(ctx, batch); err != nil {
 			c.mu.Lock()
 			c.stats.failedEvents += uint64(len(batch.Events))
@@ -286,41 +298,32 @@ func (c *ReporterClient) loop() {
 	}
 }
 
-// drainBatches moves queued events into one or more outbound batches sized at
-// most maxBatchSize, reading them out of the ring buffer in FIFO order.
-func (c *ReporterClient) drainBatches() []*usagereporting.Batch {
+// drainBatch moves the oldest queued events, at most limit and at most
+// maxBatchSize of them, out of the ring buffer into a new outbound batch. It
+// returns nil when nothing is queued.
+func (c *ReporterClient) drainBatch(limit int) *usagereporting.Batch {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.size == 0 {
+	batchSize := min(c.size, c.maxBatchSize, limit)
+	if batchSize <= 0 {
 		return nil
 	}
 
 	ringCap := len(c.ring)
-	total := c.size
-	batches := make([]*usagereporting.Batch, 0, (total+c.maxBatchSize-1)/c.maxBatchSize)
-	for emitted := 0; emitted < total; {
-		remaining := total - emitted
-		batchSize := c.maxBatchSize
-		if remaining < batchSize {
-			batchSize = remaining
-		}
-		events := make([]usagereporting.Event, batchSize)
-		for i := 0; i < batchSize; i++ {
-			idx := (c.head + emitted + i) % ringCap
-			events[i] = c.ring[idx]
-			// Release the slot so any references it holds can be GC'd while
-			// the batch is in flight.
-			c.ring[idx] = usagereporting.Event{}
-		}
-		batches = append(batches, &usagereporting.Batch{
-			DeliveryID: uuid.NewString(),
-			Events:     events,
-		})
-		emitted += batchSize
+	events := make([]usagereporting.Event, batchSize)
+	for i := range batchSize {
+		idx := (c.head + i) % ringCap
+		events[i] = c.ring[idx]
+		// Release the slot so any references it holds can be GC'd while
+		// the batch is in flight.
+		c.ring[idx] = usagereporting.Event{}
 	}
-	c.head = 0
-	c.size = 0
-	return batches
+	c.head = (c.head + batchSize) % ringCap
+	c.size -= batchSize
+	return &usagereporting.Batch{
+		DeliveryID: uuid.NewString(),
+		Events:     events,
+	}
 }
 
 func (c *ReporterClient) sendBatch(ctx context.Context, batch *usagereporting.Batch) error {

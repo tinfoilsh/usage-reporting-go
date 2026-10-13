@@ -2,9 +2,12 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +15,15 @@ import (
 
 	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 )
+
+// drainAll empties the buffer into batches the way successive flushes would.
+func drainAll(c *ReporterClient) []*usagereporting.Batch {
+	var batches []*usagereporting.Batch
+	for batch := c.drainBatch(math.MaxInt); batch != nil; batch = c.drainBatch(math.MaxInt) {
+		batches = append(batches, batch)
+	}
+	return batches
+}
 
 // TestAddEventSnapshotsReferenceFields guards against a caller mutating
 // the Meters slice or Attributes map of an event after AddEvent returns
@@ -37,7 +49,7 @@ func TestAddEventSnapshotsReferenceFields(t *testing.T) {
 	meters[0].Quantity = 999
 	attrs["model"] = "attacker-controlled"
 
-	batches := c.drainBatches()
+	batches := drainAll(c)
 	if len(batches) != 1 || len(batches[0].Events) != 1 {
 		t.Fatalf("expected one batch with one event, got %+v", batches)
 	}
@@ -73,7 +85,7 @@ func TestAddEventEnforcesBufferCeiling(t *testing.T) {
 		})
 	}
 
-	batches := c.drainBatches()
+	batches := drainAll(c)
 	if len(batches) != 1 {
 		t.Fatalf("expected one batch, got %d", len(batches))
 	}
@@ -126,7 +138,7 @@ func TestAddEventConcurrentAtCapacity(t *testing.T) {
 		t.Fatalf("concurrent overflow accounting mismatch: %+v", s)
 	}
 
-	batches := c.drainBatches()
+	batches := drainAll(c)
 	total := 0
 	seen := make(map[string]struct{})
 	for _, b := range batches {
@@ -140,6 +152,84 @@ func TestAddEventConcurrentAtCapacity(t *testing.T) {
 	}
 	if total != cap {
 		t.Fatalf("expected exactly %d buffered events under sustained pressure, got %d", cap, total)
+	}
+}
+
+// TestFlushKeepsBacklogInBoundedBuffer guards the memory bound while a batch
+// is in flight: events not yet sent stay in the ring, so buffer pressure drops
+// the oldest unsent event rather than letting drained batches pile up beside a
+// refilled buffer. A flush also stops at the events buffered when it started.
+func TestFlushKeepsBacklogInBoundedBuffer(t *testing.T) {
+	const progressTimeout = 5 * time.Second
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	var received []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch usagereporting.Batch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		for _, event := range batch.Events {
+			received = append(received, event.EventID)
+		}
+		mu.Unlock()
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	c := New(Config{
+		Endpoint:          server.URL,
+		ReporterID:        "reporter",
+		Secret:            "secret",
+		FlushInterval:     time.Hour,
+		MaxBatchSize:      1,
+		MaxBufferedEvents: 3,
+	})
+	defer c.Stop(context.Background())
+	receivedIDs := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(received)
+	}
+
+	for i := range 3 {
+		c.AddEvent(usagereporting.Event{EventID: fmt.Sprintf("event-%d", i)})
+	}
+	flushed := make(chan struct{})
+	go func() {
+		c.Flush(context.Background())
+		close(flushed)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(progressTimeout):
+		close(release)
+		t.Fatal("delivery did not start")
+	}
+	c.AddEvent(usagereporting.Event{EventID: "event-3"})
+	c.AddEvent(usagereporting.Event{EventID: "event-4"})
+	close(release)
+	select {
+	case <-flushed:
+	case <-time.After(progressTimeout):
+		t.Fatal("flush did not finish")
+	}
+
+	if got, want := receivedIDs(), []string{"event-0", "event-2", "event-3"}; !slices.Equal(got, want) {
+		t.Fatalf("flush delivered %v, want %v", got, want)
+	}
+	if s := c.Stats(); s.DroppedBufferFull != 1 || s.DeliveredEvents != 3 {
+		t.Fatalf("stats after flush: %+v", s)
+	}
+	c.Stop(context.Background())
+	if got, want := receivedIDs(), []string{"event-0", "event-2", "event-3", "event-4"}; !slices.Equal(got, want) {
+		t.Fatalf("stop delivered %v, want %v", got, want)
 	}
 }
 
