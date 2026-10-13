@@ -46,8 +46,8 @@ type Config struct {
 	MaxBufferedEvents int
 	// MaxDeliveryAttempts caps how many times one batch is sent, counting the
 	// first attempt. Transport errors, HTTP 429, and HTTP 5xx are retried with
-	// the same delivery ID and events, so a receiver that de-duplicates on
-	// (reporter ID, delivery ID) never applies a batch twice; any other non-2xx
+	// the same events under a fresh delivery ID, so a receiver that
+	// de-duplicates on EventID never applies an event twice; any other non-2xx
 	// response is final. Defaults to 6 when unset or non-positive; 1 disables
 	// retries.
 	MaxDeliveryAttempts int
@@ -67,7 +67,7 @@ type Config struct {
 
 // ReporterClient batches usage events and delivers them to the controlplane
 // over signed HTTP. Transient delivery failures are retried for a bounded time
-// with the batch's delivery ID unchanged; a batch that is rejected or runs out
+// with the batch's events unchanged; a batch that is rejected or runs out
 // of retries is logged and dropped. Events live only in memory, so callers
 // that need durable delivery must layer that on top of this client.
 type ReporterClient struct {
@@ -426,19 +426,23 @@ func (c *ReporterClient) drainBatch(limit int) *usagereporting.Batch {
 }
 
 // deliver sends batch until it is acknowledged, rejected, or out of retries.
-// Every attempt carries the same delivery ID and body, so a receiver that
-// de-duplicates on delivery ID acknowledges a batch it already committed
-// instead of billing it twice. It reports false when the batch was dropped
-// after a transient failure, meaning delivery is currently failing.
+// Every attempt carries the same events, so a receiver that de-duplicates on
+// EventID acknowledges events it already applied instead of billing them
+// twice. Each retry gets a fresh delivery ID, the signing nonce, so replay
+// protection on the nonce never rejects it. It reports false when the batch
+// was dropped after a transient failure, meaning delivery is currently
+// failing.
 func (c *ReporterClient) deliver(ctx context.Context, batch *usagereporting.Batch, maxAttempts int) bool {
-	body, err := json.Marshal(batch)
-	if err != nil {
-		c.recordFailed(batch, 0, &sendFailure{err: fmt.Errorf("marshal usage batch: %w", err)})
-		return true
-	}
-
 	start := time.Now()
 	for attempt := 1; ; attempt++ {
+		if attempt > 1 {
+			batch.DeliveryID = uuid.NewString()
+		}
+		body, err := json.Marshal(batch)
+		if err != nil {
+			c.recordFailed(batch, attempt-1, &sendFailure{err: fmt.Errorf("marshal usage batch: %w", err)})
+			return true
+		}
 		failure := c.send(ctx, batch.DeliveryID, body)
 		if failure == nil {
 			c.recordDelivered(batch, attempt)

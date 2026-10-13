@@ -38,11 +38,13 @@ type attempt struct {
 	at         time.Time
 	deliveryID string
 	eventIDs   []string
+	events     json.RawMessage // the events array exactly as sent
 }
 
 // receiver stands in for the controlplane's usage-report endpoint inside a
 // synctest bubble. It authenticates each attempt the way the controlplane's
-// verifyRequest does (signature plus timestamp window), records it, and
+// verifyRequest does (signature plus timestamp window), rejects a replayed
+// nonce as the library's contract asks of receivers, records the attempt, and
 // answers with respond(n) for the n-th attempt, counting from 0.
 type receiver struct {
 	t       *testing.T
@@ -50,10 +52,11 @@ type receiver struct {
 
 	mu       sync.Mutex
 	attempts []attempt
+	nonces   map[string]bool
 }
 
 func newReceiver(t *testing.T, respond func(n int) reply) *receiver {
-	return &receiver{t: t, respond: respond}
+	return &receiver{t: t, respond: respond, nonces: make(map[string]bool)}
 }
 
 func alwaysReply(r reply) func(int) reply {
@@ -79,22 +82,37 @@ func (r *receiver) RoundTrip(req *http.Request) (*http.Response, error) {
 		r.t.Errorf("attempt timestamp %q is stale at %s", timestamp, now.UTC().Format(time.RFC3339))
 		return response(http.StatusUnauthorized, ""), nil
 	}
-	var batch usagereporting.Batch
+	var batch struct {
+		DeliveryID string          `json:"delivery_id"`
+		Events     json.RawMessage `json:"events"`
+	}
+	var events []usagereporting.Event
 	if err := json.Unmarshal(body, &batch); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(batch.Events, &events); err != nil {
 		return nil, err
 	}
 	if batch.DeliveryID != nonce {
 		r.t.Errorf("delivery id %q differs from signed nonce %q", batch.DeliveryID, nonce)
 	}
-	eventIDs := make([]string, 0, len(batch.Events))
-	for _, event := range batch.Events {
+	eventIDs := make([]string, 0, len(events))
+	for _, event := range events {
 		eventIDs = append(eventIDs, event.EventID)
 	}
 
 	r.mu.Lock()
+	replayed := r.nonces[nonce]
+	r.nonces[nonce] = true
 	n := len(r.attempts)
-	r.attempts = append(r.attempts, attempt{at: time.Now(), deliveryID: batch.DeliveryID, eventIDs: eventIDs})
+	if !replayed {
+		r.attempts = append(r.attempts, attempt{at: time.Now(), deliveryID: batch.DeliveryID, eventIDs: eventIDs, events: batch.Events})
+	}
 	r.mu.Unlock()
+	if replayed {
+		r.t.Errorf("nonce %q was replayed", nonce)
+		return response(http.StatusUnauthorized, ""), nil
+	}
 
 	rep := r.respond(n)
 	if rep.err != nil {
@@ -139,6 +157,22 @@ func addEvents(c *ReporterClient, ids ...string) {
 	}
 }
 
+// checkResentEvents fails unless every attempt resent the first attempt's
+// events byte for byte under a delivery id of its own.
+func checkResentEvents(t *testing.T, got []attempt) {
+	t.Helper()
+	seen := make(map[string]bool)
+	for _, a := range got {
+		if seen[a.deliveryID] {
+			t.Fatalf("delivery id %s reused across attempts:%s", a.deliveryID, describe(got))
+		}
+		seen[a.deliveryID] = true
+		if !bytes.Equal(a.events, got[0].events) {
+			t.Fatalf("attempts sent different events:%s", describe(got))
+		}
+	}
+}
+
 func describe(attempts []attempt) string {
 	var b strings.Builder
 	for _, a := range attempts {
@@ -148,11 +182,13 @@ func describe(attempts []attempt) string {
 }
 
 // TestDeliveryRetriesTransientFailures checks that a batch failing with a
-// transient error is retried until it lands, as the same batch: every attempt
-// carries the same delivery ID and events, so the controlplane's
-// de-duplication can acknowledge a batch whose response was lost instead of
-// billing it twice. The waits exceed the controlplane's timestamp window, so a
-// retry that reused the first attempt's signature would be rejected as stale.
+// transient error is retried until it lands, resending the same events (same
+// event IDs, order, and content) so the controlplane's de-duplication on
+// event ID can acknowledge events whose response was lost instead of billing
+// them twice. Each attempt is a new delivery: its own delivery ID, which the
+// receiver checks against the signed nonce and rejects if replayed. The waits
+// exceed the controlplane's timestamp window, so a retry that reused the
+// first attempt's signature would also be rejected as stale.
 func TestDeliveryRetriesTransientFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -176,7 +212,9 @@ func TestDeliveryRetriesTransientFailures(t *testing.T) {
 					RetryMaxElapsed:     24 * time.Hour,
 				})
 				defer c.Stop(context.Background())
-				addEvents(c, "event-0", "event-1")
+				// The second event's ID is filled in by AddEvent, before any
+				// attempt, so every attempt must carry the same one.
+				addEvents(c, "event-0", "")
 
 				c.Flush(context.Background())
 
@@ -184,10 +222,9 @@ func TestDeliveryRetriesTransientFailures(t *testing.T) {
 				if len(got) != 3 {
 					t.Fatalf("got %d attempts, want 3:%s", len(got), describe(got))
 				}
-				for _, a := range got {
-					if a.deliveryID != got[0].deliveryID || !slices.Equal(a.eventIDs, []string{"event-0", "event-1"}) {
-						t.Fatalf("retries changed the batch:%s", describe(got))
-					}
+				checkResentEvents(t, got)
+				if ids := got[0].eventIDs; len(ids) != 2 || ids[0] != "event-0" || ids[1] == "" {
+					t.Fatalf("unexpected event ids %q", ids)
 				}
 				want := Stats{
 					Enqueued:                   2,
@@ -241,9 +278,10 @@ func TestDeliveryStopsAtAttemptLimit(t *testing.T) {
 		c.Flush(context.Background())
 
 		got := r.got()
-		if len(got) != 3 || got[1].deliveryID != got[0].deliveryID || got[2].deliveryID != got[0].deliveryID {
-			t.Fatalf("want 3 attempts of one batch:%s", describe(got))
+		if len(got) != 3 {
+			t.Fatalf("got %d attempts, want 3:%s", len(got), describe(got))
 		}
+		checkResentEvents(t, got)
 		want := Stats{Enqueued: 1, FailedEvents: 1, FailedBatches: 1, Retries: 2}
 		if s := c.Stats(); s != want {
 			t.Fatalf("stats: got %+v want %+v", s, want)
