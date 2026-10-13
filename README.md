@@ -65,11 +65,11 @@ func main() {
 }
 ```
 
-`EventID` and `OccurredAt` are filled in when omitted. Delivery is fire-and-forget: events are buffered in memory up to `MaxBufferedEvents`, flushed periodically as signed batches, and dropped with a log line if delivery fails. `Stop` performs a final flush. Callers that need durable delivery must layer it on top.
+`EventID` and `OccurredAt` are filled in when omitted. Events are buffered in memory up to `MaxBufferedEvents` and flushed periodically as signed batches. Transport errors, HTTP 429, and HTTP 5xx are retried with backoff, by default up to 6 attempts within 30 seconds (`MaxDeliveryAttempts`, `RetryMaxElapsed`); a batch that is rejected or runs out of retries is dropped with a log line. `Stop` performs a final flush bounded by its context. `Stats` reports delivery counters. Callers that need durable delivery must layer it on top.
 
 ## Receiving and verifying batches
 
-The library signs and verifies; the receiver must also reject replayed `delivery_id` values within the timestamp skew window.
+The library signs and verifies. A retried batch keeps its `delivery_id` and events and is re-signed with a fresh timestamp, so the receiver must de-duplicate a repeated `delivery_id` rather than reject it: record (`reporter_id`, `delivery_id`) in the transaction that applies the batch, and acknowledge a repeat with a 2xx without applying it again. That makes a retry after a lost response safe and also defeats replays inside the timestamp skew window, as long as records outlive that window plus the reporter's retry window. Answer 429 or 5xx only when a retry can succeed; any other non-2xx is final.
 
 ```go
 func handleUsageBatch(r *http.Request, body []byte, sharedSecret string) error {
