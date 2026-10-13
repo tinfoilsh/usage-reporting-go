@@ -281,10 +281,11 @@ func TestStatsAccounting(t *testing.T) {
 	defer server.Close()
 
 	c := New(Config{
-		Endpoint:      server.URL + "/usage",
-		ReporterID:    "reporter",
-		Secret:        "secret",
-		FlushInterval: time.Hour, // flush manually
+		Endpoint:            server.URL + "/usage",
+		ReporterID:          "reporter",
+		Secret:              "secret",
+		FlushInterval:       time.Hour, // flush manually
+		MaxDeliveryAttempts: 1,
 	})
 	defer c.Stop(context.Background())
 

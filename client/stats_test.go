@@ -97,24 +97,24 @@ func TestStatsBatchOutcomes(t *testing.T) {
 		invalidTimestampYear = 10000
 		lastSuccessStatus    = 299
 	)
+	// Transient failures are retried and covered in retry_test.go. Every row
+	// here must be attempted exactly once, which the received-events check
+	// below enforces.
 	for _, tc := range []struct {
 		name             string
 		status           int
 		endpoint         string
 		invalidTimestamp bool
-		canceled         bool
-		closedServer     bool
 	}{
 		{name: "ok", status: http.StatusOK},
 		{name: "no content", status: http.StatusNoContent},
 		{name: "last success status", status: lastSuccessStatus},
 		{name: "redirect", status: http.StatusMultipleChoices},
+		{name: "bad request", status: http.StatusBadRequest},
 		{name: "unauthorized", status: http.StatusUnauthorized},
-		{name: "server error", status: http.StatusInternalServerError},
+		{name: "payload too large", status: http.StatusRequestEntityTooLarge},
 		{name: "marshal error", invalidTimestamp: true},
 		{name: "invalid endpoint", endpoint: ":"},
-		{name: "canceled context", canceled: true},
-		{name: "transport error", closedServer: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var received []string
@@ -154,9 +154,6 @@ func TestStatsBatchOutcomes(t *testing.T) {
 			if tc.endpoint != "" {
 				endpoint = tc.endpoint
 			}
-			if tc.closedServer {
-				server.Close()
-			}
 			c := New(Config{
 				Endpoint:          endpoint,
 				ReporterID:        "reporter",
@@ -164,6 +161,9 @@ func TestStatsBatchOutcomes(t *testing.T) {
 				FlushInterval:     time.Hour,
 				MaxBufferedEvents: bufferCapacity,
 				MaxBatchSize:      batchSize,
+				// Short backoff so a wrongly retried status fails fast.
+				RetryInitialBackoff: time.Millisecond,
+				RetryMaxBackoff:     time.Millisecond,
 			})
 			defer c.Stop(context.Background())
 			if s := c.Stats(); s != (Stats{}) {
@@ -180,12 +180,7 @@ func TestStatsBatchOutcomes(t *testing.T) {
 			if s := c.Stats(); s != want {
 				t.Fatalf("buffered stats: got %+v want %+v", s, want)
 			}
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			if tc.canceled {
-				cancel()
-			}
-			c.Flush(ctx)
+			c.Flush(context.Background())
 			if tc.status >= http.StatusOK && tc.status <= lastSuccessStatus {
 				want.DeliveredEvents = bufferCapacity
 				want.DeliveredBatches = batchCount

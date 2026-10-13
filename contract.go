@@ -74,8 +74,10 @@ type Event struct {
 }
 
 type Batch struct {
-	// DeliveryID is unique for one flush attempt and is used as the signing
-	// nonce. Retried events should keep their EventID but use a new DeliveryID.
+	// DeliveryID identifies one batch and is used as the signing nonce. A
+	// retried batch keeps its DeliveryID and events (each attempt is re-signed
+	// with a fresh timestamp), so a receiver can de-duplicate on (reporter ID,
+	// DeliveryID) and acknowledge a batch it has already applied.
 	DeliveryID string  `json:"delivery_id"`
 	Events     []Event `json:"events"`
 }

@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +20,13 @@ import (
 )
 
 const (
-	defaultFlushInterval     = 2 * time.Second
-	defaultMaxBatchSize      = 1000
-	defaultMaxBufferedEvents = 100_000
+	defaultFlushInterval       = 2 * time.Second
+	defaultMaxBatchSize        = 1000
+	defaultMaxBufferedEvents   = 100_000
+	defaultMaxDeliveryAttempts = 6
+	defaultRetryInitialBackoff = time.Second
+	defaultRetryMaxBackoff     = 10 * time.Second
+	defaultRetryMaxElapsed     = 30 * time.Second
 )
 
 type Config struct {
@@ -37,20 +44,44 @@ type Config struct {
 	// ceiling is reached, the reporter degrades to "newest events win" rather
 	// than growing without limit. Defaults to 100_000 when unset or non-positive.
 	MaxBufferedEvents int
+	// MaxDeliveryAttempts caps how many times one batch is sent, counting the
+	// first attempt. Transport errors, HTTP 429, and HTTP 5xx are retried with
+	// the same delivery ID and events, so a receiver that de-duplicates on
+	// (reporter ID, delivery ID) never applies a batch twice; any other non-2xx
+	// response is final. Defaults to 6 when unset or non-positive; 1 disables
+	// retries.
+	MaxDeliveryAttempts int
+	// RetryInitialBackoff is the wait before a batch's first retry. It doubles
+	// for each further retry up to RetryMaxBackoff; every wait is drawn
+	// uniformly from [d/2, d] and is never shorter than a Retry-After header
+	// asks for. Default to 1s and 10s when unset or non-positive.
+	RetryInitialBackoff time.Duration
+	RetryMaxBackoff     time.Duration
+	// RetryMaxElapsed bounds how long one batch is retried: no retry starts
+	// more than this long after the batch's first attempt, so a failing
+	// controlplane holds up a flush for at most this long plus one request
+	// timeout. A batch still failing when its attempts or time run out is
+	// dropped. Defaults to 30s when unset or non-positive.
+	RetryMaxElapsed time.Duration
 }
 
 // ReporterClient batches usage events and delivers them to the controlplane
-// over signed HTTP. Delivery is fire-and-forget: if a batch fails, it is
-// logged and dropped. Callers that need durable delivery must layer that on
-// top of this client.
+// over signed HTTP. Transient delivery failures are retried for a bounded time
+// with the batch's delivery ID unchanged; a batch that is rejected or runs out
+// of retries is logged and dropped. Events live only in memory, so callers
+// that need durable delivery must layer that on top of this client.
 type ReporterClient struct {
-	endpoint          string
-	reporterID        string
-	secret            string
-	flushInterval     time.Duration
-	httpClient        *http.Client
-	maxBatchSize      int
-	maxBufferedEvents int
+	endpoint            string
+	reporterID          string
+	secret              string
+	flushInterval       time.Duration
+	httpClient          *http.Client
+	maxBatchSize        int
+	maxBufferedEvents   int
+	maxDeliveryAttempts int
+	retryInitialBackoff time.Duration
+	retryMaxBackoff     time.Duration
+	retryMaxElapsed     time.Duration
 
 	mu sync.Mutex
 	// ring is a fixed-capacity ring buffer holding queued events. head points
@@ -76,13 +107,16 @@ type ReporterClient struct {
 // exactly one of deliveredEvents/failedEvents/droppedBufferFull (or remains
 // buffered or in flight).
 type reporterCounters struct {
-	enqueued          uint64
-	droppedDisabled   uint64
-	droppedBufferFull uint64
-	deliveredEvents   uint64
-	deliveredBatches  uint64
-	failedEvents      uint64
-	failedBatches     uint64
+	enqueued                   uint64
+	droppedDisabled            uint64
+	droppedBufferFull          uint64
+	deliveredEvents            uint64
+	deliveredBatches           uint64
+	deliveredAfterRetryEvents  uint64
+	deliveredAfterRetryBatches uint64
+	failedEvents               uint64
+	failedBatches              uint64
+	retries                    uint64
 }
 
 // Stats is a point-in-time snapshot of the reporter's monotonic accounting
@@ -96,13 +130,21 @@ type Stats struct {
 	// DroppedBufferFull counts oldest events overwritten on buffer overflow.
 	DroppedBufferFull uint64
 	// DeliveredEvents / DeliveredBatches count events and batches acknowledged
-	// with an HTTP 2xx.
+	// with an HTTP 2xx, including those that needed retries.
 	DeliveredEvents  uint64
 	DeliveredBatches uint64
-	// FailedEvents / FailedBatches count events and batches discarded after a
-	// delivery failure (there is no retry).
+	// DeliveredAfterRetryEvents / DeliveredAfterRetryBatches count the subset
+	// of delivered events and batches acknowledged only after at least one
+	// retry.
+	DeliveredAfterRetryEvents  uint64
+	DeliveredAfterRetryBatches uint64
+	// FailedEvents / FailedBatches count events and batches permanently
+	// discarded: rejected with a non-retryable response, or still failing
+	// when their retries ran out.
 	FailedEvents  uint64
 	FailedBatches uint64
+	// Retries counts delivery attempts made after a batch's first.
+	Retries uint64
 }
 
 // Stats returns a snapshot of the reporter's delivery accounting.
@@ -110,13 +152,16 @@ func (c *ReporterClient) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Enqueued:          c.stats.enqueued,
-		DroppedDisabled:   c.stats.droppedDisabled,
-		DroppedBufferFull: c.stats.droppedBufferFull,
-		DeliveredEvents:   c.stats.deliveredEvents,
-		DeliveredBatches:  c.stats.deliveredBatches,
-		FailedEvents:      c.stats.failedEvents,
-		FailedBatches:     c.stats.failedBatches,
+		Enqueued:                   c.stats.enqueued,
+		DroppedDisabled:            c.stats.droppedDisabled,
+		DroppedBufferFull:          c.stats.droppedBufferFull,
+		DeliveredEvents:            c.stats.deliveredEvents,
+		DeliveredBatches:           c.stats.deliveredBatches,
+		DeliveredAfterRetryEvents:  c.stats.deliveredAfterRetryEvents,
+		DeliveredAfterRetryBatches: c.stats.deliveredAfterRetryBatches,
+		FailedEvents:               c.stats.failedEvents,
+		FailedBatches:              c.stats.failedBatches,
+		Retries:                    c.stats.retries,
 	}
 }
 
@@ -150,16 +195,41 @@ func New(cfg Config) *ReporterClient {
 		maxBufferedEvents = defaultMaxBufferedEvents
 	}
 
+	maxDeliveryAttempts := cfg.MaxDeliveryAttempts
+	if maxDeliveryAttempts <= 0 {
+		maxDeliveryAttempts = defaultMaxDeliveryAttempts
+	}
+
+	retryInitialBackoff := cfg.RetryInitialBackoff
+	if retryInitialBackoff <= 0 {
+		retryInitialBackoff = defaultRetryInitialBackoff
+	}
+
+	retryMaxBackoff := cfg.RetryMaxBackoff
+	if retryMaxBackoff <= 0 {
+		retryMaxBackoff = defaultRetryMaxBackoff
+	}
+	retryMaxBackoff = max(retryMaxBackoff, retryInitialBackoff)
+
+	retryMaxElapsed := cfg.RetryMaxElapsed
+	if retryMaxElapsed <= 0 {
+		retryMaxElapsed = defaultRetryMaxElapsed
+	}
+
 	c := &ReporterClient{
-		endpoint:          strings.TrimRight(cfg.Endpoint, "/"),
-		reporterID:        cfg.ReporterID,
-		secret:            cfg.Secret,
-		flushInterval:     interval,
-		httpClient:        httpClient,
-		maxBatchSize:      maxBatchSize,
-		maxBufferedEvents: maxBufferedEvents,
-		ring:              make([]usagereporting.Event, maxBufferedEvents),
-		quit:              make(chan struct{}),
+		endpoint:            strings.TrimRight(cfg.Endpoint, "/"),
+		reporterID:          cfg.ReporterID,
+		secret:              cfg.Secret,
+		flushInterval:       interval,
+		httpClient:          httpClient,
+		maxBatchSize:        maxBatchSize,
+		maxBufferedEvents:   maxBufferedEvents,
+		maxDeliveryAttempts: maxDeliveryAttempts,
+		retryInitialBackoff: retryInitialBackoff,
+		retryMaxBackoff:     retryMaxBackoff,
+		retryMaxElapsed:     retryMaxElapsed,
+		ring:                make([]usagereporting.Event, maxBufferedEvents),
+		quit:                make(chan struct{}),
 	}
 
 	if c.endpoint != "" && c.secret != "" && c.reporterID != "" {
@@ -233,9 +303,12 @@ func (c *ReporterClient) AddEvent(event usagereporting.Event) {
 	}
 }
 
-// Flush drains buffered events into batches and sends each one. Failed batches
-// are logged and discarded; there is no retry queue, so callers cannot react
-// to delivery failures.
+// Flush sends buffered events in batches, oldest first, retrying transient
+// failures as configured. It returns early, leaving the remaining events
+// buffered for the next flush, when ctx is done or when a batch is dropped
+// after its retries run out, so one call waits out at most one retry window
+// on a failing controlplane. Batches rejected with a non-retryable response
+// are logged and discarded.
 func (c *ReporterClient) Flush(ctx context.Context) {
 	if !c.Enabled() {
 		return
@@ -248,28 +321,14 @@ func (c *ReporterClient) Flush(ctx context.Context) {
 	c.mu.Lock()
 	remaining := c.size
 	c.mu.Unlock()
-	for remaining > 0 {
+	for remaining > 0 && ctx.Err() == nil {
 		batch := c.drainBatch(remaining)
 		if batch == nil {
 			return
 		}
 		remaining -= len(batch.Events)
-		if err := c.sendBatch(ctx, batch); err != nil {
-			c.mu.Lock()
-			c.stats.failedEvents += uint64(len(batch.Events))
-			c.stats.failedBatches++
-			c.mu.Unlock()
-			slog.Warn("usage reporter dropped batch",
-				"reporter_id", c.reporterID,
-				"delivery_id", batch.DeliveryID,
-				"events", len(batch.Events),
-				"error", err,
-			)
-		} else {
-			c.mu.Lock()
-			c.stats.deliveredEvents += uint64(len(batch.Events))
-			c.stats.deliveredBatches++
-			c.mu.Unlock()
+		if !c.deliver(ctx, batch, c.maxDeliveryAttempts) {
+			return
 		}
 	}
 }
@@ -326,36 +385,173 @@ func (c *ReporterClient) drainBatch(limit int) *usagereporting.Batch {
 	}
 }
 
-func (c *ReporterClient) sendBatch(ctx context.Context, batch *usagereporting.Batch) error {
+// deliver sends batch until it is acknowledged, rejected, or out of retries.
+// Every attempt carries the same delivery ID and body, so a receiver that
+// de-duplicates on delivery ID acknowledges a batch it already committed
+// instead of billing it twice. It reports false when the batch was dropped
+// after a transient failure, meaning delivery is currently failing.
+func (c *ReporterClient) deliver(ctx context.Context, batch *usagereporting.Batch, maxAttempts int) bool {
 	body, err := json.Marshal(batch)
 	if err != nil {
-		return fmt.Errorf("marshal usage batch: %w", err)
+		c.recordFailed(batch, 0, &sendFailure{err: fmt.Errorf("marshal usage batch: %w", err)})
+		return true
 	}
 
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		failure := c.send(ctx, batch.DeliveryID, body)
+		if failure == nil {
+			c.recordDelivered(batch, attempt)
+			return true
+		}
+		if !failure.transient {
+			c.recordFailed(batch, attempt, failure)
+			return true
+		}
+		if !c.awaitRetry(ctx, start, attempt, maxAttempts, failure.retryAfter) {
+			c.recordFailed(batch, attempt, failure)
+			return false
+		}
+		c.mu.Lock()
+		c.stats.retries++
+		c.mu.Unlock()
+	}
+}
+
+// awaitRetry waits out the backoff after a batch's attempt-th attempt failed
+// and reports whether to try again. It returns false without waiting when the
+// attempt limit is reached or the wait would end past the retry window, and
+// false as soon as ctx is done.
+func (c *ReporterClient) awaitRetry(ctx context.Context, start time.Time, attempt, maxAttempts int, retryAfter time.Duration) bool {
+	if attempt >= maxAttempts || ctx.Err() != nil {
+		return false
+	}
+	delay := max(c.backoff(attempt), retryAfter)
+	if delay > c.retryMaxElapsed-time.Since(start) {
+		return false
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// backoff returns the wait before retry n (counting from 1): the initial
+// backoff doubled for each earlier retry and capped, then drawn from [d/2, d]
+// so reporters that failed together do not retry in lockstep.
+func (c *ReporterClient) backoff(n int) time.Duration {
+	d := c.retryInitialBackoff
+	for i := 1; i < n && d < c.retryMaxBackoff; i++ {
+		if d > c.retryMaxBackoff/2 {
+			d = c.retryMaxBackoff
+		} else {
+			d *= 2
+		}
+	}
+	return d/2 + rand.N(d/2+1)
+}
+
+func (c *ReporterClient) recordDelivered(batch *usagereporting.Batch, attempts int) {
+	events := uint64(len(batch.Events))
+	c.mu.Lock()
+	c.stats.deliveredEvents += events
+	c.stats.deliveredBatches++
+	if attempts > 1 {
+		c.stats.deliveredAfterRetryEvents += events
+		c.stats.deliveredAfterRetryBatches++
+	}
+	c.mu.Unlock()
+	if attempts > 1 {
+		slog.Info("usage reporter delivered batch after retry",
+			"reporter_id", c.reporterID,
+			"delivery_id", batch.DeliveryID,
+			"events", len(batch.Events),
+			"attempts", attempts,
+		)
+	}
+}
+
+func (c *ReporterClient) recordFailed(batch *usagereporting.Batch, attempts int, failure *sendFailure) {
+	c.mu.Lock()
+	c.stats.failedEvents += uint64(len(batch.Events))
+	c.stats.failedBatches++
+	c.mu.Unlock()
+	slog.Warn("usage reporter dropped batch",
+		"reporter_id", c.reporterID,
+		"delivery_id", batch.DeliveryID,
+		"events", len(batch.Events),
+		"attempts", attempts,
+		"status", failure.status,
+		"error", failure.err,
+	)
+}
+
+// sendFailure describes a failed delivery attempt.
+type sendFailure struct {
+	err        error
+	status     int           // HTTP status, or 0 when no response arrived
+	transient  bool          // a later attempt may succeed
+	retryAfter time.Duration // minimum wait the receiver asked for
+}
+
+// send makes one signed delivery attempt. It returns nil once the receiver
+// acknowledges the batch with a 2xx.
+func (c *ReporterClient) send(ctx context.Context, deliveryID string, body []byte) *sendFailure {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("create usage batch request: %w", err)
+		return &sendFailure{err: fmt.Errorf("create usage batch request: %w", err)}
 	}
 
+	// Sign every attempt afresh: the signature covers the timestamp, and the
+	// receiver rejects timestamps outside its skew window.
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
-	nonce := batch.DeliveryID
-	signature := usagereporting.SignBatch(http.MethodPost, req.URL.Path, c.reporterID, timestamp, nonce, body, c.secret)
+	signature := usagereporting.SignBatch(http.MethodPost, req.URL.Path, c.reporterID, timestamp, deliveryID, body, c.secret)
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(usagereporting.HeaderReporterID, c.reporterID)
 	req.Header.Set(usagereporting.HeaderTimestamp, timestamp)
-	req.Header.Set(usagereporting.HeaderNonce, nonce)
+	req.Header.Set(usagereporting.HeaderNonce, deliveryID)
 	req.Header.Set(usagereporting.HeaderSignature, signature)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send usage batch: %w", err)
+		return &sendFailure{err: fmt.Errorf("send usage batch: %w", err), transient: true}
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("usage batch rejected with status %d", resp.StatusCode)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
 	}
+	failure := &sendFailure{
+		err:    fmt.Errorf("usage batch rejected with status %d", resp.StatusCode),
+		status: resp.StatusCode,
+	}
+	// 429 and 5xx mean the receiver could not take the batch right now. Any
+	// other status (bad signature, malformed or oversized body, a blocked
+	// redirect) would fail the same way on every attempt.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode/100 == 5 {
+		failure.transient = true
+		failure.retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+	}
+	return failure
+}
 
-	return nil
+// parseRetryAfter reads a Retry-After value given in seconds or as an HTTP
+// date. It returns 0 when the value is absent or unparseable.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return time.Duration(min(max(seconds, 0), int64(math.MaxInt64/time.Second))) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		return max(at.Sub(now), 0)
+	}
+	return 0
 }
