@@ -424,3 +424,178 @@ func TestFlushLeavesBacklogBufferedAfterGivingUp(t *testing.T) {
 		}
 	})
 }
+
+// eventAttempts counts attempts per event ID.
+func eventAttempts(attempts []attempt) map[string]int {
+	counts := make(map[string]int)
+	for _, a := range attempts {
+		for _, id := range a.eventIDs {
+			counts[id]++
+		}
+	}
+	return counts
+}
+
+// TestStopDuringOutage checks that shutdown makes a best effort within the
+// caller's context and the retry bounds, then gives up and counts every
+// undelivered event as failed rather than leaving it buffered.
+func TestStopDuringOutage(t *testing.T) {
+	const window = 30 * time.Second
+	for _, tc := range []struct {
+		name     string
+		deadline time.Duration // 0 stops with context.Background()
+		outage   time.Duration // 0 never recovers
+		check    func(t *testing.T, s Stats, attempts map[string]int, took time.Duration)
+	}{
+		{
+			name:     "caller deadline",
+			deadline: 5 * time.Second,
+			check: func(t *testing.T, s Stats, attempts map[string]int, took time.Duration) {
+				if took > 5*time.Second {
+					t.Errorf("stop took %s, past the caller's 5s deadline", took)
+				}
+				if attempts["event-1"] != 0 || attempts["event-2"] != 0 {
+					t.Errorf("batches were sent after the deadline: %v", attempts)
+				}
+				if want := (Stats{Enqueued: 3, FailedEvents: 3, FailedBatches: 3, Retries: s.Retries}); s != want {
+					t.Errorf("stats: got %+v want %+v", s, want)
+				}
+			},
+		},
+		{
+			name: "no deadline",
+			check: func(t *testing.T, s Stats, attempts map[string]int, took time.Duration) {
+				if took > window {
+					t.Errorf("stop took %s, more than one %s retry window", took, window)
+				}
+				if attempts["event-0"] < 2 || attempts["event-1"] != 1 || attempts["event-2"] != 1 {
+					t.Errorf("want retries for the first batch and one attempt for each other: %v", attempts)
+				}
+				if want := (Stats{Enqueued: 3, FailedEvents: 3, FailedBatches: 3, Retries: s.Retries}); s != want {
+					t.Errorf("stats: got %+v want %+v", s, want)
+				}
+			},
+		},
+		{
+			name:   "outage within retry window",
+			outage: 4 * time.Second,
+			check: func(t *testing.T, s Stats, attempts map[string]int, took time.Duration) {
+				if s.DeliveredEvents != 3 || s.FailedEvents != 0 {
+					t.Errorf("stop lost events to a 4s outage: %+v", s)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				r := newReceiver(t, func(int) reply {
+					if tc.outage == 0 || time.Since(start) < tc.outage {
+						return reply{status: http.StatusServiceUnavailable}
+					}
+					return reply{}
+				})
+				c := newRetryClient(r, Config{MaxBatchSize: 1, RetryMaxElapsed: window})
+				addEvents(c, "event-0", "event-1", "event-2")
+
+				ctx := context.Background()
+				if tc.deadline > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.deadline)
+					defer cancel()
+				}
+				c.Stop(ctx)
+
+				tc.check(t, c.Stats(), eventAttempts(r.got()), time.Since(start))
+			})
+		})
+	}
+}
+
+// TestStopBoundsLoopRetryByCallerContext checks that the caller's deadline
+// also cuts short a delivery the background loop is retrying when Stop is
+// called, instead of Stop blocking until that batch's retry window ends.
+func TestStopBoundsLoopRetryByCallerContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const flushInterval = time.Second
+		r := newReceiver(t, alwaysReply(reply{status: http.StatusServiceUnavailable}))
+		c := newRetryClient(r, Config{FlushInterval: flushInterval})
+		addEvents(c, "event-0")
+
+		time.Sleep(flushInterval)
+		synctest.Wait()
+		if got := r.got(); len(got) != 1 {
+			t.Fatalf("want the loop waiting to retry after one attempt:%s", describe(got))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		start := time.Now()
+		c.Stop(ctx)
+
+		if took := time.Since(start); took > 3*time.Second {
+			t.Fatalf("stop took %s, past the caller's 3s deadline", took)
+		}
+		if s := c.Stats(); s.FailedBatches != 1 || s.DeliveredBatches != 0 {
+			t.Fatalf("stats: %+v", s)
+		}
+	})
+}
+
+// TestStopSkipsRetriesWhileDeliveryIsFailing checks that when the background
+// loop has just dropped a batch with its retries exhausted, Stop does not wait
+// out another retry window: each remaining batch gets a single attempt. A
+// delivery since then clears that state, and Stop retries again.
+func TestStopSkipsRetriesWhileDeliveryIsFailing(t *testing.T) {
+	const flushInterval = time.Second
+	for _, tc := range []struct {
+		name             string
+		recoverInBetween bool
+		wantAttempts     int // for event-2, sent by Stop
+	}{
+		{name: "loop gave up", wantAttempts: 1},
+		{name: "loop delivered since", recoverInBetween: true, wantAttempts: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var healthy atomic.Bool
+				r := newReceiver(t, func(int) reply {
+					if healthy.Load() {
+						return reply{}
+					}
+					return reply{status: http.StatusServiceUnavailable}
+				})
+				c := newRetryClient(r, Config{FlushInterval: flushInterval, MaxBatchSize: 1, MaxDeliveryAttempts: 2})
+				addEvents(c, "event-0")
+
+				// The loop sends event-0 at 1s and gives up after one retry,
+				// by 2s. Sleeping to half-seconds keeps clear of the ticks.
+				time.Sleep(3*flushInterval + flushInterval/2)
+				synctest.Wait()
+				if s := c.Stats(); s.FailedBatches != 1 {
+					t.Fatalf("want the loop to have given up on event-0: %+v", s)
+				}
+				if tc.recoverInBetween {
+					healthy.Store(true)
+					addEvents(c, "event-1")
+					time.Sleep(flushInterval)
+					synctest.Wait()
+					healthy.Store(false)
+					if s := c.Stats(); s.DeliveredBatches != 1 {
+						t.Fatalf("want the loop to have delivered event-1: %+v", s)
+					}
+				}
+				addEvents(c, "event-2")
+				start := time.Now()
+				c.Stop(context.Background())
+
+				attempts := eventAttempts(r.got())
+				if attempts["event-2"] != tc.wantAttempts {
+					t.Fatalf("stop made %d attempts for event-2, want %d", attempts["event-2"], tc.wantAttempts)
+				}
+				if took := time.Since(start); (took == 0) != (tc.wantAttempts == 1) {
+					t.Fatalf("stop took %s for %d attempts", took, tc.wantAttempts)
+				}
+			})
+		})
+	}
+}

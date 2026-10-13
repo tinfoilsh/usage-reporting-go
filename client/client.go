@@ -54,7 +54,7 @@ type Config struct {
 	// RetryInitialBackoff is the wait before a batch's first retry. It doubles
 	// for each further retry up to RetryMaxBackoff; every wait is drawn
 	// uniformly from [d/2, d] and is never shorter than a Retry-After header
-	// asks for. Default to 1s and 10s when unset or non-positive.
+	// asks for. They default to 1s and 10s when unset or non-positive.
 	RetryInitialBackoff time.Duration
 	RetryMaxBackoff     time.Duration
 	// RetryMaxElapsed bounds how long one batch is retried: no retry starts
@@ -92,10 +92,16 @@ type ReporterClient struct {
 	size     int
 	dropped  uint64
 	notified uint64
+	// deliveryFailing is set when a batch is dropped after a transient
+	// failure and cleared by the next delivery. Stop skips retries while it
+	// is set.
+	deliveryFailing bool
 
-	quit     chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	// cancelLoop cancels the context the background loop delivers under.
+	cancelLoop context.CancelFunc
+	quit       chan struct{}
+	stopOnce   sync.Once
+	wg         sync.WaitGroup
 
 	stats reporterCounters // Guarded by mu along with the buffer.
 }
@@ -232,9 +238,11 @@ func New(cfg Config) *ReporterClient {
 		quit:                make(chan struct{}),
 	}
 
+	loopCtx, cancelLoop := context.WithCancel(context.Background())
+	c.cancelLoop = cancelLoop
 	if c.endpoint != "" && c.secret != "" && c.reporterID != "" {
 		c.wg.Add(1)
-		go c.loop()
+		go c.loop(loopCtx)
 	}
 
 	return c
@@ -333,15 +341,24 @@ func (c *ReporterClient) Flush(ctx context.Context) {
 	}
 }
 
+// Stop ends the background flush loop and makes a final attempt to deliver
+// everything still buffered. ctx bounds the whole shutdown, including a
+// delivery the loop is in the middle of retrying. Without a deadline, Stop
+// waits out at most one retry window on a failing controlplane: after one
+// batch is dropped with its retries exhausted, the rest get a single attempt
+// each. Batches that cannot be delivered count as failed.
 func (c *ReporterClient) Stop(ctx context.Context) {
 	c.stopOnce.Do(func() {
+		stopCancelLoop := context.AfterFunc(ctx, c.cancelLoop)
 		close(c.quit)
 		c.wg.Wait()
-		c.Flush(ctx)
+		stopCancelLoop()
+		c.cancelLoop()
+		c.flushFinal(ctx)
 	})
 }
 
-func (c *ReporterClient) loop() {
+func (c *ReporterClient) loop(ctx context.Context) {
 	defer c.wg.Done()
 
 	ticker := time.NewTicker(c.flushInterval)
@@ -350,9 +367,32 @@ func (c *ReporterClient) loop() {
 	for {
 		select {
 		case <-ticker.C:
-			c.Flush(context.Background())
+			c.Flush(ctx)
 		case <-c.quit:
 			return
+		}
+	}
+}
+
+// flushFinal sends everything still buffered once the loop has exited. Unlike
+// Flush it never leaves events behind: once delivery is known to be failing,
+// here or in the loop's last flush, remaining batches get one attempt each.
+func (c *ReporterClient) flushFinal(ctx context.Context) {
+	c.mu.Lock()
+	remaining := c.size
+	attempts := c.maxDeliveryAttempts
+	if c.deliveryFailing {
+		attempts = 1
+	}
+	c.mu.Unlock()
+	for remaining > 0 {
+		batch := c.drainBatch(remaining)
+		if batch == nil {
+			return
+		}
+		remaining -= len(batch.Events)
+		if !c.deliver(ctx, batch, attempts) {
+			attempts = 1
 		}
 	}
 }
@@ -458,6 +498,7 @@ func (c *ReporterClient) backoff(n int) time.Duration {
 func (c *ReporterClient) recordDelivered(batch *usagereporting.Batch, attempts int) {
 	events := uint64(len(batch.Events))
 	c.mu.Lock()
+	c.deliveryFailing = false
 	c.stats.deliveredEvents += events
 	c.stats.deliveredBatches++
 	if attempts > 1 {
@@ -477,6 +518,9 @@ func (c *ReporterClient) recordDelivered(batch *usagereporting.Batch, attempts i
 
 func (c *ReporterClient) recordFailed(batch *usagereporting.Batch, attempts int, failure *sendFailure) {
 	c.mu.Lock()
+	if failure.transient {
+		c.deliveryFailing = true
+	}
 	c.stats.failedEvents += uint64(len(batch.Events))
 	c.stats.failedBatches++
 	c.mu.Unlock()
