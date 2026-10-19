@@ -48,7 +48,7 @@ Delivery is fire-and-forget: failed batches are logged and dropped, so callers t
 
 ## Receiving batches
 
-`VerifyBatch` checks only the HMAC signature over the headers returned by `HeaderValues` and the body. Receivers must also reject stale timestamps and any `delivery_id` (the signing nonce) already seen within the allowed skew window; otherwise a captured batch can be replayed and billed twice.
+`VerifyBatch` checks only the HMAC signature, which covers the request method and path, the reporter ID, timestamp, and nonce returned by `HeaderValues`, and the body; pass it the method and path the request arrived on. Receivers must also reject stale timestamps and any `delivery_id` (the signing nonce) already seen within the allowed skew window; otherwise a captured batch can be replayed and billed twice.
 
 ## Propagating request context
 
