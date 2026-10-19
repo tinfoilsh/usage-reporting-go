@@ -44,6 +44,10 @@ Delivery is fire-and-forget: failed batches are logged and dropped, so callers t
 
 `VerifyBatch` checks only the HMAC signature over the headers returned by `HeaderValues` and the body. Receivers must also reject stale timestamps and any `delivery_id` (the signing nonce) already seen within the allowed skew window; otherwise a captured batch can be replayed and billed twice.
 
+## Propagating request context
+
+A service that calls another usage-reporting service attaches a signed context with `SetHeaders`; when its `BillCustomerRequest` is false, the downstream reports `CustomerRequests: 0` instead of billing the same customer request twice. The downstream reads it with `FromHeaders`: if the header is present but invalid, reject the request rather than billing it as a new one. A call without the header bills as its own customer request.
+
 ## Development
 
 Run `go test ./...`.
