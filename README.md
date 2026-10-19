@@ -11,31 +11,37 @@ go get github.com/tinfoilsh/usage-reporting-go@latest
 ## Sending events
 
 ```go
+package main
+
 import (
+	"context"
+
 	usagereporting "github.com/tinfoilsh/usage-reporting-go"
 	usageclient "github.com/tinfoilsh/usage-reporting-go/client"
 )
 
-reporter := usageclient.New(usageclient.Config{
-	Endpoint:   "https://controlplane.example.com" + usagereporting.IngestionPath,
-	ReporterID: "router-prod-abc123",
-	Secret:     sharedSecret,
-})
-defer reporter.Stop(context.Background())
+func main() {
+	reporter := usageclient.New(usageclient.Config{
+		Endpoint:   "https://controlplane.example.com" + usagereporting.IngestionPath,
+		ReporterID: "router-prod-abc123",
+		Secret:     "shared-secret",
+	})
+	defer reporter.Stop(context.Background())
 
-reporter.AddEvent(usagereporting.Event{
-	RequestID: "req_123",
-	Operation: usagereporting.Operation{
-		Service: usagereporting.ServiceRouter,
-		Name:    usagereporting.OperationRouterModelRequest,
-	},
-	APIKey:           apiKey,
-	CustomerRequests: 1,
-	Meters: []usagereporting.Meter{
-		{Name: usagereporting.MeterInputTokens, Quantity: 120},
-		{Name: usagereporting.MeterOutputTokens, Quantity: 48},
-	},
-})
+	reporter.AddEvent(usagereporting.Event{
+		RequestID: "req_123",
+		Operation: usagereporting.Operation{
+			Service: usagereporting.ServiceRouter,
+			Name:    usagereporting.OperationRouterModelRequest,
+		},
+		APIKey:           "sk-example",
+		CustomerRequests: 1,
+		Meters: []usagereporting.Meter{
+			{Name: usagereporting.MeterInputTokens, Quantity: 120},
+			{Name: usagereporting.MeterOutputTokens, Quantity: 48},
+		},
+	})
+}
 ```
 
 Delivery is fire-and-forget: failed batches are logged and dropped, so callers that need durable delivery must add it themselves.
